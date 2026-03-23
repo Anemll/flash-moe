@@ -198,6 +198,8 @@ struct ChatView: View {
 
             var gotTokens = false
             for await token in stream {
+                // Skip prefill progress tokens (negative tokensGenerated)
+                if token.tokensGenerated < 0 { continue }
                 gotTokens = true
                 // Strip special tokens that leak through
                 let clean = token.text
@@ -215,6 +217,7 @@ struct ChatView: View {
                 let formattedPrompt = buildChatPrompt(userMessage: text)
                 let fallbackStream = engine.generate(prompt: formattedPrompt, maxTokens: 500)
                 for await token in fallbackStream {
+                    if token.tokensGenerated < 0 { continue }
                     let clean = token.text
                         .replacingOccurrences(of: "<|im_end|>", with: "")
                         .replacingOccurrences(of: "<|im_start|>", with: "")
