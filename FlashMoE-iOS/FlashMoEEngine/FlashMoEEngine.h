@@ -124,6 +124,13 @@ void flashmoe_reset(FlashMoEContext *ctx);
 // Get current engine stats. Fills the provided struct.
 void flashmoe_get_stats(FlashMoEContext *ctx, FlashMoEStats *stats);
 
+// ---- Profiling ----
+
+// Run a short timing profile: generates N tokens with --timing enabled.
+// Returns a malloc'd string with the timing report (caller must free).
+// Returns NULL on error.
+char *flashmoe_run_profile(FlashMoEContext *ctx, int num_tokens);
+
 // ---- Utility ----
 
 // Check if a model directory is valid (has config.json, packed_experts/, etc.)

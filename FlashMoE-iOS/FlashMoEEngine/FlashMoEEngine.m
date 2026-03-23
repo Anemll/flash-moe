@@ -1126,6 +1126,109 @@ void flashmoe_get_stats(FlashMoEContext *ctx, FlashMoEStats *stats) {
     stats->ttft_ms = ctx->ttft_ms;
 }
 
+// ============================================================================
+// Profiling — run short generation with timing and return report string
+// ============================================================================
+
+char *flashmoe_run_profile(FlashMoEContext *ctx, int num_tokens) {
+    if (!ctx || !ctx->loaded) return NULL;
+
+    // Enable timing, reset accumulators
+    g_timing_enabled = 1;
+    memset(&g_timing, 0, sizeof(g_timing));
+
+    // Reset state for clean profile run
+    flashmoe_reset(ctx);
+
+    // Generate with "Hi" prompt (minimal prefill)
+    int generated = flashmoe_generate(ctx, "Hi", num_tokens, NULL, NULL);
+
+    // Build report string
+    char *buf = malloc(4096);
+    if (!buf) { g_timing_enabled = 0; return NULL; }
+    int pos = 0;
+    int n = g_timing.count;
+    int toks = g_timing.token_count;
+
+    if (n == 0 || toks == 0) {
+        pos += snprintf(buf + pos, 4096 - pos, "No timing data (generated %d tokens)\n", generated);
+        g_timing_enabled = 0;
+        return buf;
+    }
+
+    // Per-token decode breakdown
+    double dense_attn_ms = (g_timing.cmd1_submit + g_timing.cmd1_wait + g_timing.cpu_attn) / n * g_cfg.num_layers;
+    double oproj_shared_ms = (g_timing.cmd2_encode + g_timing.cmd2_wait + g_timing.routing_cpu) / n * g_cfg.num_layers;
+    double expert_io_ms = g_timing.expert_io / n * g_cfg.num_layers;
+    double expert_compute_ms = (g_timing.cmd3_encode + g_timing.deferred_wait + g_timing.deferred_cpu) / n * g_cfg.num_layers;
+    double lm_ms = g_timing.lm_head / toks;
+    double total_ms = dense_attn_ms + oproj_shared_ms + expert_io_ms + expert_compute_ms + lm_ms;
+
+    double linear_ms = (g_timing.count_linear > 0) ? g_timing.total_linear / g_timing.count_linear * g_cfg.num_linear_layers : 0;
+    double full_ms = (g_timing.count_full > 0) ? g_timing.total_full / g_timing.count_full * g_cfg.num_full_attn_layers : 0;
+
+    pos += snprintf(buf + pos, 4096 - pos,
+        "Decode Breakdown (%d tokens)\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n", toks);
+    pos += snprintf(buf + pos, 4096 - pos,
+        "Dense/attn (CMD1):  %5.1f ms  %4.1f%%\n"
+        "  GatedDeltaNet:    %5.1f ms  (%d layers)\n"
+        "  Full attention:   %5.1f ms  (%d layers)\n",
+        dense_attn_ms, 100*dense_attn_ms/total_ms,
+        linear_ms, g_cfg.num_linear_layers,
+        full_ms, g_cfg.num_full_attn_layers);
+    pos += snprintf(buf + pos, 4096 - pos,
+        "o_proj+shared (CMD2): %3.1f ms  %4.1f%%\n",
+        oproj_shared_ms, 100*oproj_shared_ms/total_ms);
+    pos += snprintf(buf + pos, 4096 - pos,
+        "Expert I/O (SSD):   %5.1f ms  %4.1f%%\n",
+        expert_io_ms, 100*expert_io_ms/total_ms);
+    pos += snprintf(buf + pos, 4096 - pos,
+        "Expert compute:     %5.1f ms  %4.1f%%\n",
+        expert_compute_ms, 100*expert_compute_ms/total_ms);
+    pos += snprintf(buf + pos, 4096 - pos,
+        "LM head:            %5.1f ms  %4.1f%%\n",
+        lm_ms, 100*lm_ms/total_ms);
+    pos += snprintf(buf + pos, 4096 - pos,
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Total per token:    %5.1f ms  (%.1f tok/s)\n"
+        "TTFT:               %5.0f ms\n"
+        "Expert quant:       %d-bit\n"
+        "Experts:            %d (K=%d)\n",
+        total_ms, 1000.0/total_ms,
+        ctx->ttft_ms,
+        g_use_2bit ? 2 : (g_use_q3_experts ? 3 : 4),
+        g_cfg.num_experts, ctx->K);
+
+    // Per-layer avg
+    pos += snprintf(buf + pos, 4096 - pos,
+        "\nPer-Layer Avg (ms):\n"
+        "  deferred_wait:  %6.3f\n"
+        "  cmd1 (submit):  %6.3f\n"
+        "  cmd1 (wait):    %6.3f\n"
+        "  cpu_attn:       %6.3f\n"
+        "  cmd2 (encode):  %6.3f\n"
+        "  cmd2 (wait):    %6.3f\n"
+        "  routing_cpu:    %6.3f\n"
+        "  expert_io:      %6.3f\n"
+        "  cmd3_encode:    %6.3f\n",
+        g_timing.deferred_wait / n,
+        g_timing.cmd1_submit / n,
+        g_timing.cmd1_wait / n,
+        g_timing.cpu_attn / n,
+        g_timing.cmd2_encode / n,
+        g_timing.cmd2_wait / n,
+        g_timing.routing_cpu / n,
+        g_timing.expert_io / n,
+        g_timing.cmd3_encode / n);
+
+    // Also log to NSLog
+    NSLog(@"[profile]\n%s", buf);
+
+    g_timing_enabled = 0;
+    return buf;
+}
+
 int flashmoe_validate_model(const char *model_path) {
     if (!model_path) return -1;
 
