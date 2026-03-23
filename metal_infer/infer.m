@@ -71,52 +71,194 @@
 // Model constants
 // ============================================================================
 
-#define HIDDEN_DIM          4096
-#define NUM_LAYERS          60
-#define NUM_ATTN_HEADS      32
-#define NUM_KV_HEADS        2
-#define HEAD_DIM            256
-#define VOCAB_SIZE          248320
-#define RMS_NORM_EPS        1e-6f
-#define NUM_EXPERTS         512
-#define NUM_EXPERTS_PER_TOK 10
-#define MOE_INTERMEDIATE    1024
-#define SHARED_INTERMEDIATE 1024
-#define FULL_ATTN_INTERVAL  4
-#define GROUP_SIZE          64
+// ============================================================================
+// Model configuration — runtime values loaded from model_weights.json
+// MAX_* constants are compile-time upper bounds for static array sizing.
+// g_cfg.* are the actual runtime values for the loaded model.
+// ============================================================================
+
+// Compile-time maximums (for static arrays — must be >= any supported model)
+#define MAX_LAYERS          64
+#define MAX_EXPERTS         512
+#define MAX_HIDDEN_DIM      4096
+#define MAX_K               8
+
+// Runtime model configuration (populated from config.json / model_weights.json)
+typedef struct {
+    int hidden_dim;
+    int num_layers;
+    int num_attn_heads;
+    int num_kv_heads;
+    int head_dim;
+    int vocab_size;
+    int num_experts;
+    int num_experts_per_tok;
+    int moe_intermediate;
+    int shared_intermediate;
+    int full_attn_interval;
+    int group_size;
+    int linear_num_v_heads;
+    int linear_num_k_heads;
+    int linear_key_dim;
+    int linear_value_dim;
+    int conv_kernel_size;
+    float rope_theta;
+    float partial_rotary;
+    float rms_norm_eps;
+    // Derived
+    int linear_total_key;    // linear_num_k_heads * linear_key_dim
+    int linear_total_value;  // linear_num_v_heads * linear_value_dim
+    int linear_conv_dim;     // linear_total_key * 2 + linear_total_value
+    int rotary_dim;          // head_dim * partial_rotary
+    int num_full_attn_layers;
+    int num_linear_layers;
+    // 4-bit expert component offsets (computed from hidden_dim, moe_intermediate, group_size)
+    size_t gate_w_off_4, gate_s_off_4, gate_b_off_4;
+    size_t up_w_off_4, up_s_off_4, up_b_off_4;
+    size_t down_w_off_4, down_s_off_4, down_b_off_4;
+    size_t expert_size_computed;
+    // 2-bit expert component offsets
+    size_t gate_w_off_2, gate_s_off_2, gate_b_off_2;
+    size_t up_w_off_2, up_s_off_2, up_b_off_2;
+    size_t down_w_off_2, down_s_off_2, down_b_off_2;
+    size_t expert_size_2bit_computed;
+} ModelConfig;
+
+static ModelConfig g_cfg = {0};
+
+// Initialize config with 397B defaults (overridden by model_weights.json if present)
+static void config_init_defaults(void) {
+    g_cfg.hidden_dim = 4096;
+    g_cfg.num_layers = 60;
+    g_cfg.num_attn_heads = 32;
+    g_cfg.num_kv_heads = 2;
+    g_cfg.head_dim = 256;
+    g_cfg.vocab_size = 248320;
+    g_cfg.num_experts = 512;
+    g_cfg.num_experts_per_tok = 10;
+    g_cfg.moe_intermediate = 1024;
+    g_cfg.shared_intermediate = 1024;
+    g_cfg.full_attn_interval = 4;
+    g_cfg.group_size = 64;
+    g_cfg.linear_num_v_heads = 64;
+    g_cfg.linear_num_k_heads = 16;
+    g_cfg.linear_key_dim = 128;
+    g_cfg.linear_value_dim = 128;
+    g_cfg.conv_kernel_size = 4;
+    g_cfg.rope_theta = 10000000.0f;
+    g_cfg.partial_rotary = 0.25f;
+    g_cfg.rms_norm_eps = 1e-6f;
+    // Derived
+    g_cfg.linear_total_key = g_cfg.linear_num_k_heads * g_cfg.linear_key_dim;
+    g_cfg.linear_total_value = g_cfg.linear_num_v_heads * g_cfg.linear_value_dim;
+    g_cfg.linear_conv_dim = g_cfg.linear_total_key * 2 + g_cfg.linear_total_value;
+    g_cfg.rotary_dim = (int)(g_cfg.head_dim * g_cfg.partial_rotary);
+    g_cfg.num_full_attn_layers = g_cfg.num_layers / g_cfg.full_attn_interval;
+    g_cfg.num_linear_layers = g_cfg.num_layers - g_cfg.num_full_attn_layers;
+}
+
+static void config_update_derived(void) {
+    g_cfg.linear_total_key = g_cfg.linear_num_k_heads * g_cfg.linear_key_dim;
+    g_cfg.linear_total_value = g_cfg.linear_num_v_heads * g_cfg.linear_value_dim;
+    g_cfg.linear_conv_dim = g_cfg.linear_total_key * 2 + g_cfg.linear_total_value;
+    g_cfg.rotary_dim = (int)(g_cfg.head_dim * g_cfg.partial_rotary);
+    g_cfg.num_full_attn_layers = g_cfg.num_layers / g_cfg.full_attn_interval;
+    g_cfg.num_linear_layers = g_cfg.num_layers - g_cfg.num_full_attn_layers;
+
+    // Compute expert component offsets (matches iOS compute_expert_offsets)
+    int mid = g_cfg.moe_intermediate;
+    int hid = g_cfg.hidden_dim;
+    int gs = g_cfg.group_size;
+
+    for (int b = 4; b >= 2; b -= 2) {
+        int vals_per_u32 = 32 / b;
+        // gate_proj [mid, hid]
+        size_t gw = (size_t)mid * ((hid + vals_per_u32 - 1) / vals_per_u32) * 4;
+        size_t gs_sz = (size_t)mid * ((hid + gs - 1) / gs) * 2;
+        size_t gb = gs_sz;
+        // up_proj [mid, hid] — same shape
+        size_t uw = gw, us = gs_sz, ub = gb;
+        // down_proj [hid, mid]
+        size_t dw = (size_t)hid * ((mid + vals_per_u32 - 1) / vals_per_u32) * 4;
+        size_t ds = (size_t)hid * ((mid + gs - 1) / gs) * 2;
+        size_t db = ds;
+
+        size_t off = 0;
+        if (b == 4) {
+            g_cfg.gate_w_off_4 = off; off += gw;
+            g_cfg.gate_s_off_4 = off; off += gs_sz;
+            g_cfg.gate_b_off_4 = off; off += gb;
+            g_cfg.up_w_off_4   = off; off += uw;
+            g_cfg.up_s_off_4   = off; off += us;
+            g_cfg.up_b_off_4   = off; off += ub;
+            g_cfg.down_w_off_4 = off; off += dw;
+            g_cfg.down_s_off_4 = off; off += ds;
+            g_cfg.down_b_off_4 = off; off += db;
+            g_cfg.expert_size_computed = off;
+        } else {
+            g_cfg.gate_w_off_2 = off; off += gw;
+            g_cfg.gate_s_off_2 = off; off += gs_sz;
+            g_cfg.gate_b_off_2 = off; off += gb;
+            g_cfg.up_w_off_2   = off; off += uw;
+            g_cfg.up_s_off_2   = off; off += us;
+            g_cfg.up_b_off_2   = off; off += ub;
+            g_cfg.down_w_off_2 = off; off += dw;
+            g_cfg.down_s_off_2 = off; off += ds;
+            g_cfg.down_b_off_2 = off; off += db;
+            g_cfg.expert_size_2bit_computed = off;
+        }
+    }
+    // expert_size_computed is already set above
+}
+
+// Backward-compatible #defines that reference g_cfg (for gradual migration)
+#define HIDDEN_DIM          (g_cfg.hidden_dim)
+#define NUM_LAYERS          (g_cfg.num_layers)
+#define NUM_ATTN_HEADS      (g_cfg.num_attn_heads)
+#define NUM_KV_HEADS        (g_cfg.num_kv_heads)
+#define HEAD_DIM            (g_cfg.head_dim)
+#define VOCAB_SIZE          (g_cfg.vocab_size)
+#define RMS_NORM_EPS        (g_cfg.rms_norm_eps)
+#define NUM_EXPERTS         (g_cfg.num_experts)
+#define NUM_EXPERTS_PER_TOK (g_cfg.num_experts_per_tok)
+#define MOE_INTERMEDIATE    (g_cfg.moe_intermediate)
+#define SHARED_INTERMEDIATE (g_cfg.shared_intermediate)
+#define FULL_ATTN_INTERVAL  (g_cfg.full_attn_interval)
+#define GROUP_SIZE          (g_cfg.group_size)
 #define BITS                4
 #define GGUF_QK8_0          32
 #define GGUF_QK_K           256
 
-// Linear attention (GatedDeltaNet) constants
-#define LINEAR_NUM_V_HEADS  64
-#define LINEAR_NUM_K_HEADS  16
-#define LINEAR_KEY_DIM      128   // head_k_dim
-#define LINEAR_VALUE_DIM    128   // head_v_dim
-#define LINEAR_TOTAL_KEY    (LINEAR_NUM_K_HEADS * LINEAR_KEY_DIM)   // 2048
-#define LINEAR_TOTAL_VALUE  (LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM) // 8192
-#define LINEAR_CONV_DIM     (LINEAR_TOTAL_KEY * 2 + LINEAR_TOTAL_VALUE) // 12288
-#define CONV_KERNEL_SIZE    4
+// Linear attention
+#define LINEAR_NUM_V_HEADS  (g_cfg.linear_num_v_heads)
+#define LINEAR_NUM_K_HEADS  (g_cfg.linear_num_k_heads)
+#define LINEAR_KEY_DIM      (g_cfg.linear_key_dim)
+#define LINEAR_VALUE_DIM    (g_cfg.linear_value_dim)
+#define LINEAR_TOTAL_KEY    (g_cfg.linear_total_key)
+#define LINEAR_TOTAL_VALUE  (g_cfg.linear_total_value)
+#define LINEAR_CONV_DIM     (g_cfg.linear_conv_dim)
+#define CONV_KERNEL_SIZE    (g_cfg.conv_kernel_size)
 
-// Full attention constants
-#define ROPE_THETA          10000000.0f
-#define PARTIAL_ROTARY      0.25f
-#define ROTARY_DIM          (int)(HEAD_DIM * PARTIAL_ROTARY)  // 64
+// Full attention
+#define ROPE_THETA          (g_cfg.rope_theta)
+#define PARTIAL_ROTARY      (g_cfg.partial_rotary)
+#define ROTARY_DIM          (g_cfg.rotary_dim)
 
 // Expert packed binary layout (from existing code)
-#define EXPERT_SIZE         7077888
+// Expert size — computed from config, or auto-detected from packed_experts/layer_00.bin
+#define EXPERT_SIZE         ((int)g_cfg.expert_size_computed)
 
-// 2-bit expert layout (from repack_experts_2bit.py)
-#define EXPERT_SIZE_2BIT    3932160
-#define GATE_W_OFF_2  0
-#define GATE_S_OFF_2  1048576
-#define GATE_B_OFF_2  1179648
-#define UP_W_OFF_2    1310720
-#define UP_S_OFF_2    2359296
-#define UP_B_OFF_2    2490368
-#define DOWN_W_OFF_2  2621440
-#define DOWN_S_OFF_2  3670016
-#define DOWN_B_OFF_2  3801088
+// 2-bit expert layout — computed dynamically from config
+#define EXPERT_SIZE_2BIT    ((int)g_cfg.expert_size_2bit_computed)
+#define GATE_W_OFF_2  ((int)g_cfg.gate_w_off_2)
+#define GATE_S_OFF_2  ((int)g_cfg.gate_s_off_2)
+#define GATE_B_OFF_2  ((int)g_cfg.gate_b_off_2)
+#define UP_W_OFF_2    ((int)g_cfg.up_w_off_2)
+#define UP_S_OFF_2    ((int)g_cfg.up_s_off_2)
+#define UP_B_OFF_2    ((int)g_cfg.up_b_off_2)
+#define DOWN_W_OFF_2  ((int)g_cfg.down_w_off_2)
+#define DOWN_S_OFF_2  ((int)g_cfg.down_s_off_2)
+#define DOWN_B_OFF_2  ((int)g_cfg.down_b_off_2)
 
 // Streamed Q3 expert layout for normal layers:
 //   gate/up   = exact GGUF IQ3_XXS bytes
@@ -147,6 +289,12 @@
 // KV cache maximum context length
 #define MAX_SEQ_LEN 1048576  // 1M context — only 15 full-attn layers need KV cache, ~15GB at max
 #define GPU_KV_SEQ  8192     // GPU KV buffer pre-allocation (grows if exceeded, falls back to CPU attn)
+
+// Runtime KV sequence limit — set before model load.
+// On iOS: capped to max_tokens (prompt + generation). On macOS: MAX_SEQ_LEN.
+// kv_cache_new() and GPU buffers use this instead of MAX_SEQ_LEN.
+static int g_kv_seq_len = MAX_SEQ_LEN;
+static int g_gpu_kv_seq = GPU_KV_SEQ;  // runtime GPU KV buffer size (may be < GPU_KV_SEQ)
 
 // Special tokens
 #define EOS_TOKEN_1         248046
@@ -247,7 +395,7 @@ typedef struct {
     uint32_t raw_size;
 } LZ4IndexEntry;
 
-static LZ4IndexEntry *g_lz4_index[NUM_LAYERS];  // per-layer index (NULL if not using LZ4)
+static LZ4IndexEntry *g_lz4_index[MAX_LAYERS];  // per-layer index (NULL if not using LZ4)
 static void *g_lz4_comp_bufs[8];                 // pre-allocated compressed read buffers (MAX_K=8)
 static int g_use_lz4 = 0;                        // auto-detected from packed_experts_lz4/
 
@@ -255,14 +403,93 @@ static int g_use_lz4 = 0;                        // auto-detected from packed_ex
 // Expert frequency tracking (diagnostic: --freq flag)
 // ============================================================================
 
-static int g_expert_freq[NUM_LAYERS][NUM_EXPERTS];  // activation count per (layer, expert)
+static int g_expert_freq[MAX_LAYERS][MAX_EXPERTS];  // activation count per (layer, expert)
 static int g_freq_tracking = 0;  // enabled by --freq flag
 static int g_use_2bit = 0;       // enabled by --2bit flag: use packed_experts_2bit/ + 2-bit kernel
-static int g_layer_is_2bit[NUM_LAYERS];  // per-layer quant: 1=2-bit, 0=4-bit (for mixed quant)
+static int g_layer_is_2bit[MAX_LAYERS];  // per-layer quant: 1=2-bit, 0=4-bit (for mixed quant)
+
+// ============================================================================
+// Tiered quantization: per-expert 2-bit or 4-bit within the same layer file
+// ============================================================================
+
+typedef struct {
+    size_t offset;   // byte offset in layer_XX.bin
+    size_t size;     // bytes to read
+    int bits;        // 2 or 4
+} TieredExpertInfo;
+
+static TieredExpertInfo *g_tiered_manifest = NULL;  // [num_layers * num_experts]
+static int g_use_tiered = 0;
+
+#define TIERED(l, e) g_tiered_manifest[(l) * g_cfg.num_experts + (e)]
+
+static int load_tiered_manifest(const char *model_path) {
+    @autoreleasepool {
+        char manifest_path[1024];
+        snprintf(manifest_path, sizeof(manifest_path),
+                 "%s/packed_experts_tiered/tiered_manifest.json", model_path);
+
+        NSData *data = [NSData dataWithContentsOfFile:
+            [NSString stringWithUTF8String:manifest_path]];
+        if (!data) return 0;
+
+        NSError *err = nil;
+        NSDictionary *root = [NSJSONSerialization JSONObjectWithData:data options:0 error:&err];
+        if (!root || err) {
+            fprintf(stderr, "[tiered] Failed to parse %s\n", manifest_path);
+            return 0;
+        }
+
+        int num_layers = [root[@"num_layers"] intValue];
+        int num_experts = [root[@"num_experts"] intValue];
+
+        if (num_layers != g_cfg.num_layers || num_experts != g_cfg.num_experts) {
+            fprintf(stderr, "[tiered] Manifest mismatch: %dx%d vs config %dx%d\n",
+                    num_layers, num_experts, g_cfg.num_layers, g_cfg.num_experts);
+            return 0;
+        }
+
+        g_tiered_manifest = calloc(num_layers * num_experts, sizeof(TieredExpertInfo));
+
+        NSDictionary *layers = root[@"layers"];
+        int hot = 0, cold = 0;
+        for (int l = 0; l < num_layers; l++) {
+            NSString *lk = [NSString stringWithFormat:@"%d", l];
+            NSDictionary *layer_info = layers[lk];
+            NSArray *experts = layer_info[@"experts"];
+            if (!experts || (int)[experts count] != num_experts) {
+                // No per-expert info — assume uniform 4-bit
+                for (int e = 0; e < num_experts; e++) {
+                    TIERED(l, e).offset = (size_t)e * g_cfg.expert_size_computed;
+                    TIERED(l, e).size = g_cfg.expert_size_computed;
+                    TIERED(l, e).bits = 4;
+                    hot++;
+                }
+                continue;
+            }
+            for (int e = 0; e < num_experts; e++) {
+                NSDictionary *exp = experts[e];
+                int bits = [exp[@"bits"] intValue];
+                if (bits != 2 && bits != 4) {
+                    fprintf(stderr, "[tiered] ERROR: layer %d expert %d has invalid bits=%d\n", l, e, bits);
+                    bits = 4;
+                }
+                TIERED(l, e).offset = [exp[@"offset"] unsignedLongLongValue];
+                TIERED(l, e).size = [exp[@"size"] unsignedLongLongValue];
+                TIERED(l, e).bits = bits;
+                if (bits == 4) hot++; else cold++;
+            }
+        }
+
+        printf("[tiered] Loaded manifest: %d hot (4-bit), %d cold (2-bit), %.1f%% hot\n",
+               hot, cold, 100.0 * hot / (hot + cold));
+        return 1;
+    }
+}
 static int g_use_q3_experts = 0;         // enabled by --q3-experts flag: use packed_experts_Q3/ with exact GGUF routed experts
-static int g_layer_is_q3_hybrid[NUM_LAYERS];  // per-layer quant: 1=Q3 hybrid, 0=4-bit
+static int g_layer_is_q3_hybrid[MAX_LAYERS];  // per-layer quant: 1=Q3 hybrid, 0=4-bit
 static int g_use_q3_outlier = 0;  // active layer override: exact layer-27 IQ4_XS gate/up + Q5_K down
-static int g_layer_is_q3_outlier[NUM_LAYERS];
+static int g_layer_is_q3_outlier[MAX_LAYERS];
 static int g_cache_telemetry_enabled = 0;  // enabled by --cache-telemetry flag
 static int g_cache_io_split = 1;  // enabled by --cache-io-split N: split each routed expert pread into N page-aligned chunks
 static int g_think_budget = 2048; // max thinking tokens before force-emitting </think>
@@ -271,7 +498,7 @@ static int g_nax_disabled = 1;   // NAX disabled by default (slower for M=1 deco
 
 // Tiered I/O: cold fds (F_NOCACHE) for first reads, warm fds (page cached) for repeats
 static int *g_layer_fds_cold = NULL;    // [NUM_LAYERS] cold fds (set in main)
-static uint8_t g_expert_seen[NUM_LAYERS][NUM_EXPERTS / 8];  // bitset: seen before?
+static uint8_t g_expert_seen[MAX_LAYERS][MAX_EXPERTS / 8];  // bitset: seen before?
 
 // Async pread state defined after InferPreadTask (see below)
 
@@ -327,6 +554,14 @@ static inline ExpertQuantKind layer_expert_quant_kind(int layer) {
     return EXPERT_QUANT_4BIT;
 }
 
+// Per-expert quant kind for tiered mode
+static inline ExpertQuantKind tiered_expert_quant_kind(int layer, int expert) {
+    if (g_use_tiered && g_tiered_manifest) {
+        return (TIERED(layer, expert).bits == 2) ? EXPERT_QUANT_2BIT : EXPERT_QUANT_4BIT;
+    }
+    return layer_expert_quant_kind(layer);
+}
+
 static inline ExpertLayout expert_layout_for_kind(ExpertQuantKind kind) {
     switch (kind) {
         case EXPERT_QUANT_2BIT:
@@ -363,9 +598,9 @@ static inline ExpertLayout expert_layout_for_kind(ExpertQuantKind kind) {
         default:
             return (ExpertLayout) {
                 .expert_size = EXPERT_SIZE,
-                .gate_w_off = 0,        .gate_s_off = 2097152, .gate_b_off = 2228224,
-                .up_w_off   = 2359296,  .up_s_off   = 4456448, .up_b_off   = 4587520,
-                .down_w_off = 4718592,  .down_s_off = 6815744, .down_b_off = 6946816,
+                .gate_w_off = (int)g_cfg.gate_w_off_4, .gate_s_off = (int)g_cfg.gate_s_off_4, .gate_b_off = (int)g_cfg.gate_b_off_4,
+                .up_w_off   = (int)g_cfg.up_w_off_4,   .up_s_off   = (int)g_cfg.up_s_off_4,   .up_b_off   = (int)g_cfg.up_b_off_4,
+                .down_w_off = (int)g_cfg.down_w_off_4,  .down_s_off = (int)g_cfg.down_s_off_4,  .down_b_off = (int)g_cfg.down_b_off_4,
                 .gate_kind = EXPERT_PROJ_AFFINE,
                 .up_kind = EXPERT_PROJ_AFFINE,
                 .down_kind = EXPERT_PROJ_AFFINE,
@@ -384,6 +619,7 @@ static inline const char *expert_quant_label(ExpertQuantKind kind) {
 }
 
 static inline const char *requested_expert_quant_label(void) {
+    if (g_use_tiered) return "tiered (4/2-bit)";
     if (g_use_q3_experts) return "Q3-GGUF";
     if (g_use_2bit) return "2-bit";
     return "4-bit";
@@ -419,9 +655,9 @@ typedef struct {
 } CacheTelemetry;
 
 static CacheTelemetry g_cache_telemetry = {0};
-static uint8_t g_cache_seen[NUM_LAYERS][NUM_EXPERTS];
-static uint64_t g_cache_last_touch_token[NUM_LAYERS][NUM_EXPERTS];
-static uint64_t g_cache_last_evict_token[NUM_LAYERS][NUM_EXPERTS];
+static uint8_t g_cache_seen[MAX_LAYERS][MAX_EXPERTS];
+static uint64_t g_cache_last_touch_token[MAX_LAYERS][MAX_EXPERTS];
+static uint64_t g_cache_last_evict_token[MAX_LAYERS][MAX_EXPERTS];
 
 static void cache_telemetry_reset(void) {
     memset(&g_cache_telemetry, 0, sizeof(g_cache_telemetry));
@@ -695,6 +931,118 @@ static TensorManifest *load_manifest(const char *json_path) {
     }
 }
 
+// Load model config from model_weights.json "config" section
+static void load_config_from_manifest(const char *json_path) {
+    @autoreleasepool {
+        NSData *data = [NSData dataWithContentsOfFile:
+            [NSString stringWithUTF8String:json_path]];
+        if (!data) return;
+
+        NSError *error = nil;
+        NSDictionary *root = [NSJSONSerialization JSONObjectWithData:data options:0 error:&error];
+        if (!root) return;
+
+        NSDictionary *cfg = root[@"config"];
+        if (!cfg) {
+            fprintf(stderr, "[config] No 'config' section in manifest, using defaults\n");
+            return;
+        }
+
+        // Read values with defaults
+        if (cfg[@"hidden_size"])         g_cfg.hidden_dim = [cfg[@"hidden_size"] intValue];
+        if (cfg[@"num_hidden_layers"])   g_cfg.num_layers = [cfg[@"num_hidden_layers"] intValue];
+        if (cfg[@"num_attention_heads"]) g_cfg.num_attn_heads = [cfg[@"num_attention_heads"] intValue];
+        if (cfg[@"num_key_value_heads"]) g_cfg.num_kv_heads = [cfg[@"num_key_value_heads"] intValue];
+        if (cfg[@"head_dim"])            g_cfg.head_dim = [cfg[@"head_dim"] intValue];
+        if (cfg[@"vocab_size"])          g_cfg.vocab_size = [cfg[@"vocab_size"] intValue];
+        if (cfg[@"num_experts"])         g_cfg.num_experts = [cfg[@"num_experts"] intValue];
+        if (cfg[@"num_experts_per_tok"]) g_cfg.num_experts_per_tok = [cfg[@"num_experts_per_tok"] intValue];
+        if (cfg[@"moe_intermediate_size"]) g_cfg.moe_intermediate = [cfg[@"moe_intermediate_size"] intValue];
+        if (cfg[@"shared_expert_intermediate_size"]) g_cfg.shared_intermediate = [cfg[@"shared_expert_intermediate_size"] intValue];
+        if (cfg[@"full_attention_interval"]) g_cfg.full_attn_interval = [cfg[@"full_attention_interval"] intValue];
+        if (cfg[@"rms_norm_eps"])        g_cfg.rms_norm_eps = [cfg[@"rms_norm_eps"] floatValue];
+        if (cfg[@"rope_theta"])          g_cfg.rope_theta = [cfg[@"rope_theta"] floatValue];
+        if (cfg[@"partial_rotary_factor"]) g_cfg.partial_rotary = [cfg[@"partial_rotary_factor"] floatValue];
+
+        // Linear attention
+        if (cfg[@"linear_num_value_heads"]) g_cfg.linear_num_v_heads = [cfg[@"linear_num_value_heads"] intValue];
+        if (cfg[@"linear_num_key_heads"])   g_cfg.linear_num_k_heads = [cfg[@"linear_num_key_heads"] intValue];
+        if (cfg[@"linear_key_head_dim"])    g_cfg.linear_key_dim = [cfg[@"linear_key_head_dim"] intValue];
+        if (cfg[@"linear_value_head_dim"])  g_cfg.linear_value_dim = [cfg[@"linear_value_head_dim"] intValue];
+        if (cfg[@"linear_conv_kernel_dim"]) g_cfg.conv_kernel_size = [cfg[@"linear_conv_kernel_dim"] intValue];
+
+        config_update_derived();
+
+        // Validate against MAX_* bounds
+        if (g_cfg.num_layers > MAX_LAYERS) {
+            fprintf(stderr, "ERROR: num_layers %d exceeds MAX_LAYERS %d\n", g_cfg.num_layers, MAX_LAYERS);
+            exit(1);
+        }
+        if (g_cfg.num_experts > MAX_EXPERTS) {
+            fprintf(stderr, "ERROR: num_experts %d exceeds MAX_EXPERTS %d\n", g_cfg.num_experts, MAX_EXPERTS);
+            exit(1);
+        }
+        if (g_cfg.hidden_dim > MAX_HIDDEN_DIM) {
+            fprintf(stderr, "ERROR: hidden_dim %d exceeds MAX_HIDDEN_DIM %d\n", g_cfg.hidden_dim, MAX_HIDDEN_DIM);
+            exit(1);
+        }
+
+        printf("[config] Model: hidden=%d, layers=%d (%d linear + %d full), "
+               "experts=%d (K=%d), moe_dim=%d, vocab=%d\n",
+               g_cfg.hidden_dim, g_cfg.num_layers,
+               g_cfg.num_linear_layers, g_cfg.num_full_attn_layers,
+               g_cfg.num_experts, g_cfg.num_experts_per_tok,
+               g_cfg.moe_intermediate, g_cfg.vocab_size);
+    }
+}
+
+// Also load from standalone config.json (e.g. from iOS model package)
+static void load_config_from_config_json(const char *model_path) {
+    @autoreleasepool {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/config.json", model_path);
+        NSData *data = [NSData dataWithContentsOfFile:
+            [NSString stringWithUTF8String:path]];
+        if (!data) return;
+
+        NSError *error = nil;
+        NSDictionary *root = [NSJSONSerialization JSONObjectWithData:data options:0 error:&error];
+        if (!root) return;
+
+        // Check for text_config (multimodal models nest config there)
+        NSDictionary *cfg = root[@"text_config"];
+        if (!cfg) cfg = root;
+
+        if (cfg[@"hidden_size"])         g_cfg.hidden_dim = [cfg[@"hidden_size"] intValue];
+        if (cfg[@"num_hidden_layers"])   g_cfg.num_layers = [cfg[@"num_hidden_layers"] intValue];
+        if (cfg[@"num_attention_heads"]) g_cfg.num_attn_heads = [cfg[@"num_attention_heads"] intValue];
+        if (cfg[@"num_key_value_heads"]) g_cfg.num_kv_heads = [cfg[@"num_key_value_heads"] intValue];
+        if (cfg[@"head_dim"])            g_cfg.head_dim = [cfg[@"head_dim"] intValue];
+        if (cfg[@"vocab_size"])          g_cfg.vocab_size = [cfg[@"vocab_size"] intValue];
+        if (cfg[@"num_experts"])         g_cfg.num_experts = [cfg[@"num_experts"] intValue];
+        if (cfg[@"num_experts_per_tok"]) g_cfg.num_experts_per_tok = [cfg[@"num_experts_per_tok"] intValue];
+        if (cfg[@"moe_intermediate_size"]) g_cfg.moe_intermediate = [cfg[@"moe_intermediate_size"] intValue];
+        if (cfg[@"shared_expert_intermediate_size"]) g_cfg.shared_intermediate = [cfg[@"shared_expert_intermediate_size"] intValue];
+        if (cfg[@"full_attention_interval"]) g_cfg.full_attn_interval = [cfg[@"full_attention_interval"] intValue];
+        if (cfg[@"rms_norm_eps"])        g_cfg.rms_norm_eps = [cfg[@"rms_norm_eps"] floatValue];
+        if (cfg[@"linear_num_value_heads"]) g_cfg.linear_num_v_heads = [cfg[@"linear_num_value_heads"] intValue];
+        if (cfg[@"linear_num_key_heads"])   g_cfg.linear_num_k_heads = [cfg[@"linear_num_key_heads"] intValue];
+        if (cfg[@"linear_key_head_dim"])    g_cfg.linear_key_dim = [cfg[@"linear_key_head_dim"] intValue];
+        if (cfg[@"linear_value_head_dim"])  g_cfg.linear_value_dim = [cfg[@"linear_value_head_dim"] intValue];
+        if (cfg[@"linear_conv_kernel_dim"]) g_cfg.conv_kernel_size = [cfg[@"linear_conv_kernel_dim"] intValue];
+
+        // rope_theta may be in rope_parameters
+        NSDictionary *rope = cfg[@"rope_parameters"];
+        if (!rope) rope = cfg[@"rope_scaling"];
+        if (rope && rope[@"rope_theta"]) g_cfg.rope_theta = [rope[@"rope_theta"] floatValue];
+        if (cfg[@"partial_rotary_factor"]) g_cfg.partial_rotary = [cfg[@"partial_rotary_factor"] floatValue];
+        if (rope && rope[@"partial_rotary_factor"]) g_cfg.partial_rotary = [rope[@"partial_rotary_factor"] floatValue];
+
+        config_update_derived();
+        printf("[config] Loaded from %s\n", path);
+    }
+}
+
 // Hash table for O(1) tensor lookup (replaces O(N) linear scan).
 // FNV-1a hash, open addressing with linear probing.
 #define TENSOR_HT_SIZE 8192  // power of 2, > 4x num_tensors (2092)
@@ -756,19 +1104,25 @@ typedef struct {
     void *gguf_full_attn_data;
     size_t gguf_full_attn_size;
     char *gguf_full_attn_path;
-    void *gguf_full_attn_q_layers[NUM_LAYERS];
-    void *gguf_full_attn_k_layers[NUM_LAYERS];
-    void *gguf_full_attn_v_layers[NUM_LAYERS];
-    void *gguf_full_attn_o_layers[NUM_LAYERS];
+    void *gguf_full_attn_q_layers[MAX_LAYERS];
+    void *gguf_full_attn_k_layers[MAX_LAYERS];
+    void *gguf_full_attn_v_layers[MAX_LAYERS];
+    void *gguf_full_attn_o_layers[MAX_LAYERS];
     void *gguf_qkv_data;
     size_t gguf_qkv_size;
     char *gguf_qkv_path;
-    void *gguf_qkv_layers[NUM_LAYERS];
+    void *gguf_qkv_layers[MAX_LAYERS];
     void *gguf_linear_data;
     size_t gguf_linear_size;
     char *gguf_linear_path;
-    void *gguf_linear_z_layers[NUM_LAYERS];
-    void *gguf_linear_out_layers[NUM_LAYERS];
+    void *gguf_linear_z_layers[MAX_LAYERS];
+    void *gguf_linear_out_layers[MAX_LAYERS];
+    void *gguf_shared_data;
+    size_t gguf_shared_size;
+    char *gguf_shared_path;
+    void *gguf_shared_gate_layers[MAX_LAYERS];
+    void *gguf_shared_up_layers[MAX_LAYERS];
+    void *gguf_shared_down_layers[MAX_LAYERS];
     void *gguf_lm_head_data;
     size_t gguf_lm_head_size;
     char *gguf_lm_head_path;
@@ -1218,6 +1572,128 @@ static int attach_gguf_linear_overlay(WeightFile *wf, const char *bin_path, cons
     return 1;
 }
 
+static int attach_gguf_shared_overlay(WeightFile *wf, const char *bin_path, const char *json_path) {
+    if (!bin_path || !*bin_path) {
+        return 1;
+    }
+    if (!json_path || !*json_path) {
+        fprintf(stderr, "ERROR: GGUF shared overlay requires both --gguf-shared-bin and --gguf-shared-json\n");
+        return 0;
+    }
+
+    int fd = open(bin_path, O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, "ERROR: Cannot open GGUF shared overlay %s: %s\n", bin_path, strerror(errno));
+        return 0;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        fprintf(stderr, "ERROR: Cannot stat GGUF shared overlay %s: %s\n", bin_path, strerror(errno));
+        close(fd);
+        return 0;
+    }
+
+    void *data = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (data == MAP_FAILED) {
+        fprintf(stderr, "ERROR: mmap failed for GGUF shared overlay %s: %s\n", bin_path, strerror(errno));
+        return 0;
+    }
+
+    memset(wf->gguf_shared_gate_layers, 0, sizeof(wf->gguf_shared_gate_layers));
+    memset(wf->gguf_shared_up_layers, 0, sizeof(wf->gguf_shared_up_layers));
+    memset(wf->gguf_shared_down_layers, 0, sizeof(wf->gguf_shared_down_layers));
+
+    @autoreleasepool {
+        NSData *json_data = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:json_path]];
+        if (!json_data) {
+            fprintf(stderr, "ERROR: Cannot read GGUF shared overlay manifest %s\n", json_path);
+            munmap(data, (size_t)st.st_size);
+            return 0;
+        }
+
+        NSError *error = nil;
+        NSDictionary *root = [NSJSONSerialization JSONObjectWithData:json_data options:0 error:&error];
+        if (!root) {
+            fprintf(stderr, "ERROR: JSON parse failed for %s: %s\n",
+                    json_path, [[error localizedDescription] UTF8String]);
+            munmap(data, (size_t)st.st_size);
+            return 0;
+        }
+
+        NSArray *entries = root[@"entries"];
+        if (!entries) {
+            fprintf(stderr, "ERROR: GGUF shared overlay manifest missing 'entries': %s\n", json_path);
+            munmap(data, (size_t)st.st_size);
+            return 0;
+        }
+
+        for (NSDictionary *entry in entries) {
+            int layer = [entry[@"layer"] intValue];
+            NSString *role = entry[@"role"];
+            uint64_t offset = [entry[@"offset"] unsignedLongLongValue];
+            uint64_t size = [entry[@"size"] unsignedLongLongValue];
+            NSArray *shape = entry[@"shape"];
+            NSString *tensor_type = entry[@"tensor_type"];
+            if (layer < 0 || layer >= NUM_LAYERS) {
+                fprintf(stderr, "ERROR: GGUF shared overlay layer out of range in %s\n", json_path);
+                munmap(data, (size_t)st.st_size);
+                return 0;
+            }
+            if (offset + size > (uint64_t)st.st_size) {
+                fprintf(stderr, "ERROR: GGUF shared overlay entry out of bounds in %s\n", json_path);
+                munmap(data, (size_t)st.st_size);
+                return 0;
+            }
+            if (!tensor_type || strcmp([tensor_type UTF8String], "Q8_0") != 0) {
+                fprintf(stderr, "ERROR: GGUF shared overlay expected Q8_0 entries in %s\n", json_path);
+                munmap(data, (size_t)st.st_size);
+                return 0;
+            }
+            if (!shape || [shape count] != 2) {
+                fprintf(stderr, "ERROR: GGUF shared overlay expected 2D shapes in %s\n", json_path);
+                munmap(data, (size_t)st.st_size);
+                return 0;
+            }
+            int in_dim = [shape[0] intValue];
+            int out_dim = [shape[1] intValue];
+            size_t expected_size = (size_t)out_dim * (size_t)(in_dim / GGUF_QK8_0) * sizeof(GGUFBlockQ8_0);
+            if ((size_t)size != expected_size) {
+                fprintf(stderr,
+                        "ERROR: GGUF shared overlay size mismatch for layer %d role %s: got %llu bytes, expected %zu\n",
+                        layer, [role UTF8String], (unsigned long long)size, expected_size);
+                munmap(data, (size_t)st.st_size);
+                return 0;
+            }
+
+            void **slot = NULL;
+            if ([role isEqualToString:@"gate"]) {
+                slot = &wf->gguf_shared_gate_layers[layer];
+            } else if ([role isEqualToString:@"up"]) {
+                slot = &wf->gguf_shared_up_layers[layer];
+            } else if ([role isEqualToString:@"down"]) {
+                slot = &wf->gguf_shared_down_layers[layer];
+            } else {
+                fprintf(stderr, "ERROR: GGUF shared overlay unknown role '%s' in %s\n",
+                        [role UTF8String], json_path);
+                munmap(data, (size_t)st.st_size);
+                return 0;
+            }
+            *slot = (char *)data + offset;
+        }
+    }
+
+    madvise(data, (size_t)st.st_size, MADV_RANDOM);
+    wf->gguf_shared_data = data;
+    wf->gguf_shared_size = (size_t)st.st_size;
+    wf->gguf_shared_path = strdup(bin_path);
+
+    printf("[shared] Using GGUF shared overlay from %s (%.2f GB)\n",
+           bin_path, wf->gguf_shared_size / 1e9);
+    return 1;
+}
+
 static int attach_gguf_lm_head(WeightFile *wf, const char *bin_path) {
     if (!bin_path || !*bin_path) {
         return 1;
@@ -1300,6 +1776,70 @@ static Vocabulary *load_vocab(const char *path) {
     }
 
     fclose(f);
+
+    // Auto-detect BPE-encoded vocab (Ġ=space, Ċ=newline) and decode in-place
+    // Check token 271 which should be "\n\n" — if it contains Ċ (0xC4 0x8A), needs decoding
+    int needs_bpe_decode = 0;
+    if (v->tokens[271] && v->lengths[271] >= 2) {
+        unsigned char *t = (unsigned char *)v->tokens[271];
+        if (t[0] == 0xC4 && t[1] == 0x8A) needs_bpe_decode = 1;  // Ċ = U+010A
+    }
+
+    if (needs_bpe_decode) {
+        // Build GPT-2 byte decoder: maps Unicode codepoint -> raw byte
+        int byte_decoder[65536];
+        memset(byte_decoder, -1, sizeof(byte_decoder));
+        {
+            // Printable ASCII ranges map to themselves
+            int bs[512]; int cs[512]; int nb = 0;
+            for (int b = '!'; b <= '~'; b++) { bs[nb] = b; cs[nb] = b; nb++; }
+            for (int b = 0xA1; b <= 0xAC; b++) { bs[nb] = b; cs[nb] = b; nb++; }
+            for (int b = 0xAE; b <= 0xFF; b++) { bs[nb] = b; cs[nb] = b; nb++; }
+            // Non-printable bytes get mapped to 256+
+            int n = 0;
+            for (int b = 0; b < 256; b++) {
+                int found = 0;
+                for (int j = 0; j < nb; j++) { if (bs[j] == b) { found = 1; break; } }
+                if (!found) { bs[nb+n] = b; cs[nb+n] = 256 + n; n++; }
+            }
+            for (int i = 0; i < nb + n; i++) byte_decoder[cs[i]] = bs[i];
+        }
+
+        int fixed = 0;
+        for (uint32_t i = 0; i < num_entries; i++) {
+            if (!v->tokens[i] || v->lengths[i] == 0) continue;
+            // Decode: iterate Unicode codepoints, map through byte_decoder
+            unsigned char *src = (unsigned char *)v->tokens[i];
+            int src_len = v->lengths[i];
+            unsigned char *dst = malloc(src_len + 1);
+            int di = 0;
+            for (int si = 0; si < src_len; ) {
+                // Decode UTF-8 codepoint
+                uint32_t cp;
+                int cplen;
+                if (src[si] < 0x80) { cp = src[si]; cplen = 1; }
+                else if ((src[si] & 0xE0) == 0xC0) { cp = (src[si] & 0x1F) << 6 | (src[si+1] & 0x3F); cplen = 2; }
+                else if ((src[si] & 0xF0) == 0xE0) { cp = (src[si] & 0x0F) << 12 | (src[si+1] & 0x3F) << 6 | (src[si+2] & 0x3F); cplen = 3; }
+                else { cp = src[si]; cplen = 1; }  // fallback
+
+                int raw = (cp < 65536) ? byte_decoder[cp] : -1;
+                if (raw >= 0) {
+                    dst[di++] = (unsigned char)raw;
+                } else {
+                    // Unknown codepoint, copy UTF-8 bytes as-is
+                    for (int j = 0; j < cplen && si + j < src_len; j++) dst[di++] = src[si + j];
+                }
+                si += cplen;
+            }
+            dst[di] = '\0';
+            free(v->tokens[i]);
+            v->tokens[i] = (char *)dst;
+            v->lengths[i] = di;
+            fixed++;
+        }
+        printf("[vocab] Auto-decoded BPE encoding (%d tokens fixed)\n", fixed);
+    }
+
     printf("[vocab] Loaded %d tokens\n", num_entries);
     return v;
 }
@@ -1984,6 +2524,7 @@ typedef struct {
     id<MTLBuffer> gguf_qkv_buf;      // optional GGUF Q8_0 qkv overlay blob
     id<MTLBuffer> gguf_full_attn_buf; // optional GGUF Q8_0 full-attention overlay blob
     id<MTLBuffer> gguf_linear_buf;   // optional GGUF Q8_0 linear-attn gate/out overlay blob
+    id<MTLBuffer> gguf_shared_buf;   // optional reconstructed shared-expert Q8_0 overlay blob
     id<MTLBuffer> gguf_lm_head_buf;  // optional GGUF Q6_K LM head blob
     // Batched matmul output slots (preallocated, reused across dispatches)
     id<MTLBuffer> batch_out[MAX_BATCH_SLOTS];
@@ -2019,9 +2560,8 @@ typedef struct {
     id<MTLBuffer> buf_h_mid;        // [HIDDEN_DIM floats] residual+oproj result
     id<MTLBuffer> buf_sum_sq;       // [1 float] for RMS norm reduction
     // GPU attention buffers (for full attention layers)
-    #define NUM_FULL_ATTN_LAYERS 15
-    id<MTLBuffer> buf_kv_k[NUM_FULL_ATTN_LAYERS];  // K cache per full-attn layer
-    id<MTLBuffer> buf_kv_v[NUM_FULL_ATTN_LAYERS];  // V cache per full-attn layer
+    id<MTLBuffer> buf_kv_k[16];  // K cache per full-attn layer (max 16)
+    id<MTLBuffer> buf_kv_v[16];  // V cache per full-attn layer (max 16)
     id<MTLBuffer> buf_attn_q;       // [NUM_ATTN_HEADS * HEAD_DIM floats] all query heads
     id<MTLBuffer> buf_attn_scores;  // [NUM_ATTN_HEADS * MAX_SEQ_LEN floats] all heads' scores
     id<MTLBuffer> buf_attn_out;     // [NUM_ATTN_HEADS * HEAD_DIM floats] full attention output
@@ -2041,9 +2581,8 @@ typedef struct {
     id<MTLComputePipelineState> compute_decay_beta; // g_decay and beta_gate for delta-net
     id<MTLComputePipelineState> gated_rms_norm;  // z-gated output normalization
     // Persistent GPU state buffers for linear attention layers
-    #define NUM_LINEAR_LAYERS 45
-    id<MTLBuffer> buf_delta_state[NUM_LINEAR_LAYERS];   // [64*128*128] float per layer
-    id<MTLBuffer> buf_conv_state[NUM_LINEAR_LAYERS];     // [3*12288] float per layer
+    id<MTLBuffer> buf_delta_state[48];   // [v_heads*k_dim*v_dim] float per layer (max 48)
+    id<MTLBuffer> buf_conv_state[48];   // [conv_kernel*conv_dim] float per layer (max 48)
     // Scratch buffers for delta-net inputs/outputs
     id<MTLBuffer> buf_delta_q;        // [2048] float
     id<MTLBuffer> buf_delta_k;        // [2048] float
@@ -2072,30 +2611,52 @@ static MetalCtx *metal_setup(void) {
         free(ctx); return NULL;
     }
 
-    // Compile shaders from source
+    // Load shaders — try precompiled default.metallib first (iOS app bundle),
+    // then fall back to runtime compilation from source (CLI / macOS dev)
     NSError *error = nil;
-    NSArray *paths = @[@"shaders.metal", @"metal_infer/shaders.metal"];
-    NSString *src = nil;
-    for (NSString *p in paths) {
-        src = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:&error];
-        if (src) break;
-    }
-    if (!src) {
-        fprintf(stderr, "ERROR: Cannot find shaders.metal\n");
-        free(ctx); return NULL;
-    }
-
-    MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
-    opts.mathMode = MTLMathModeFast;
-    opts.languageVersion = MTLLanguageVersion3_1;
     double t0 = now_ms();
-    ctx->library = [ctx->device newLibraryWithSource:src options:opts error:&error];
-    if (!ctx->library) {
-        fprintf(stderr, "ERROR: Shader compile failed: %s\n",
-                [[error localizedDescription] UTF8String]);
-        free(ctx); return NULL;
+
+#ifdef CHAT_MODE
+    // iOS: Xcode compiles shaders.metal into default.metallib in the app bundle
+    ctx->library = [ctx->device newDefaultLibrary];
+    if (ctx->library) {
+        if (!g_stream_mode) printf("[metal] Using precompiled default.metallib\n");
     }
-    if (!g_stream_mode) printf("[metal] Shader compile: %.0f ms\n", now_ms() - t0);
+#endif
+
+    if (!ctx->library) {
+        // Fall back to runtime source compilation (CLI builds)
+        NSArray *paths = @[@"shaders.metal", @"metal_infer/shaders.metal"];
+        NSString *src = nil;
+        for (NSString *p in paths) {
+            src = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:&error];
+            if (src) break;
+        }
+#ifdef CHAT_MODE
+        // iOS: also try app bundle resource
+        if (!src) {
+            NSString *bundlePath = [[NSBundle mainBundle] pathForResource:@"shaders" ofType:@"metal"];
+            if (bundlePath) {
+                src = [NSString stringWithContentsOfFile:bundlePath encoding:NSUTF8StringEncoding error:&error];
+            }
+        }
+#endif
+        if (!src) {
+            fprintf(stderr, "ERROR: Cannot find shaders.metal\n");
+            free(ctx); return NULL;
+        }
+
+        MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
+        opts.mathMode = MTLMathModeFast;
+        opts.languageVersion = MTLLanguageVersion3_1;
+        ctx->library = [ctx->device newLibraryWithSource:src options:opts error:&error];
+        if (!ctx->library) {
+            fprintf(stderr, "ERROR: Shader compile failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            free(ctx); return NULL;
+        }
+        if (!g_stream_mode) printf("[metal] Shader compile: %.0f ms\n", now_ms() - t0);
+    }
 
     // Create pipelines
     id<MTLComputePipelineState> (^makePipe)(NSString *) = ^(NSString *name) {
@@ -2149,6 +2710,15 @@ static MetalCtx *metal_setup(void) {
                 nax_src = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:&error];
                 if (nax_src) break;
             }
+#ifdef CHAT_MODE
+            // iOS/macOS app: also try app bundle resource
+            if (!nax_src) {
+                NSString *bundlePath = [[NSBundle mainBundle] pathForResource:@"nax_gemm" ofType:@"metal"];
+                if (bundlePath) {
+                    nax_src = [NSString stringWithContentsOfFile:bundlePath encoding:NSUTF8StringEncoding error:&error];
+                }
+            }
+#endif
             if (nax_src) {
                 MTLCompileOptions *nax_opts = [[MTLCompileOptions alloc] init];
                 nax_opts.languageVersion = (MTLLanguageVersion)0x40000;  // Metal 4.0
@@ -2286,11 +2856,13 @@ static MetalCtx *metal_setup(void) {
     ctx->buf_cmd3_sum_sq    = [ctx->device newBufferWithLength:sizeof(float)
                                                         options:MTLResourceStorageModeShared];
 
-    // GPU attention buffers
+    // GPU attention buffers — sized to min(g_kv_seq_len, GPU_KV_SEQ)
     {
         size_t kv_dim = NUM_KV_HEADS * HEAD_DIM;  // 512
-        size_t kv_cache_size = GPU_KV_SEQ * kv_dim * sizeof(float);
-        for (int i = 0; i < NUM_FULL_ATTN_LAYERS; i++) {
+        int gpu_kv = (g_kv_seq_len < GPU_KV_SEQ) ? g_kv_seq_len : GPU_KV_SEQ;
+        g_gpu_kv_seq = gpu_kv;  // store for runtime GPU attention bounds check
+        size_t kv_cache_size = (size_t)gpu_kv * kv_dim * sizeof(float);
+        for (int i = 0; i < g_cfg.num_full_attn_layers; i++) {
             ctx->buf_kv_k[i] = [ctx->device newBufferWithLength:kv_cache_size
                                                         options:MTLResourceStorageModeShared];
             ctx->buf_kv_v[i] = [ctx->device newBufferWithLength:kv_cache_size
@@ -2298,20 +2870,21 @@ static MetalCtx *metal_setup(void) {
         }
         ctx->buf_attn_q      = [ctx->device newBufferWithLength:NUM_ATTN_HEADS * HEAD_DIM * sizeof(float)
                                                         options:MTLResourceStorageModeShared];
-        ctx->buf_attn_scores = [ctx->device newBufferWithLength:(size_t)NUM_ATTN_HEADS * GPU_KV_SEQ * sizeof(float)
+        ctx->buf_attn_scores = [ctx->device newBufferWithLength:(size_t)NUM_ATTN_HEADS * gpu_kv * sizeof(float)
                                                         options:MTLResourceStorageModeShared];
         ctx->buf_attn_out    = [ctx->device newBufferWithLength:NUM_ATTN_HEADS * HEAD_DIM * sizeof(float)
                                                         options:MTLResourceStorageModeShared];
         ctx->buf_attn_gate   = [ctx->device newBufferWithLength:NUM_ATTN_HEADS * HEAD_DIM * sizeof(float)
                                                         options:MTLResourceStorageModeShared];
+        printf("[metal] GPU_KV_SEQ = %d\n", gpu_kv);
         printf("[metal] GPU attention buffers: %d KV caches (%.1f MB each), scores buf %.1f MB\n",
-               NUM_FULL_ATTN_LAYERS, kv_cache_size / 1e6,
-               (double)(NUM_ATTN_HEADS * MAX_SEQ_LEN * sizeof(float)) / 1e6);
+               g_cfg.num_full_attn_layers, kv_cache_size / 1e6,
+               (double)(NUM_ATTN_HEADS * gpu_kv * sizeof(float)) / 1e6);
     }
 
     // Persistent GPU state buffers for delta-net (linear attention layers)
     if (ctx->delta_net_step) {
-        for (int i = 0; i < NUM_LINEAR_LAYERS; i++) {
+        for (int i = 0; i < g_cfg.num_linear_layers; i++) {
             ctx->buf_delta_state[i] = [ctx->device newBufferWithLength:64*128*128*sizeof(float)
                                                                options:MTLResourceStorageModeShared];
             memset([ctx->buf_delta_state[i] contents], 0, 64*128*128*sizeof(float));
@@ -2329,8 +2902,8 @@ static MetalCtx *metal_setup(void) {
         ctx->buf_conv_input    = [ctx->device newBufferWithLength:12288*sizeof(float) options:MTLResourceStorageModeShared];
         ctx->buf_conv_output   = [ctx->device newBufferWithLength:12288*sizeof(float) options:MTLResourceStorageModeShared];
         printf("[metal] Delta-net GPU buffers: %d layers (%.1f MB state + %.1f MB scratch)\n",
-               NUM_LINEAR_LAYERS,
-               NUM_LINEAR_LAYERS * (64*128*128*4 + 3*12288*4) / 1e6,
+               g_cfg.num_linear_layers,
+               g_cfg.num_linear_layers * (64*128*128*4 + 3*12288*4) / 1e6,
                (2048+2048+8192+64+64+8192+12288+12288) * 4 / 1e6);
     }
 
@@ -2345,7 +2918,7 @@ static MetalCtx *metal_setup(void) {
 // Reset delta-net and conv GPU state buffers (call at start of new generation)
 static void reset_delta_net_state(void) {
     if (!g_metal || !g_metal->delta_net_step) return;
-    for (int i = 0; i < NUM_LINEAR_LAYERS; i++) {
+    for (int i = 0; i < g_cfg.num_linear_layers; i++) {
         if (g_metal->buf_delta_state[i])
             memset([g_metal->buf_delta_state[i] contents], 0, 64*128*128*sizeof(float));
         if (g_metal->buf_conv_state[i])
@@ -2440,6 +3013,23 @@ static void metal_set_gguf_linear(MetalCtx *ctx, void *data, size_t size) {
                 size / 1e9);
     } else {
         printf("[metal] GGUF linear overlay wrapped as Metal buffer (%.2f GB)\n",
+               size / 1e9);
+    }
+}
+
+static void metal_set_gguf_shared(MetalCtx *ctx, void *data, size_t size) {
+    if (!ctx || !data || size == 0) {
+        return;
+    }
+    ctx->gguf_shared_buf = [ctx->device newBufferWithBytesNoCopy:data
+                                                          length:size
+                                                         options:MTLResourceStorageModeShared
+                                                     deallocator:nil];
+    if (!ctx->gguf_shared_buf) {
+        fprintf(stderr, "WARNING: Cannot wrap GGUF shared overlay as Metal buffer (%.2f GB)\n",
+                size / 1e9);
+    } else {
+        printf("[metal] GGUF shared overlay wrapped as Metal buffer (%.2f GB)\n",
                size / 1e9);
     }
 }
@@ -2710,6 +3300,7 @@ enum {
     MATVEC_SOURCE_GGUF_QKV = 1,
     MATVEC_SOURCE_GGUF_FULL_ATTN = 2,
     MATVEC_SOURCE_GGUF_LINEAR = 3,
+    MATVEC_SOURCE_GGUF_SHARED = 4,
 };
 
 static id<MTLBuffer> matvec_source_buffer(MetalCtx *ctx, uint8_t source, const char **base_out) {
@@ -2729,6 +3320,9 @@ static id<MTLBuffer> matvec_source_buffer(MetalCtx *ctx, uint8_t source, const c
             break;
         case MATVEC_SOURCE_GGUF_LINEAR:
             buf = ctx->gguf_linear_buf;
+            break;
+        case MATVEC_SOURCE_GGUF_SHARED:
+            buf = ctx->gguf_shared_buf;
             break;
         default:
             buf = nil;
@@ -3209,8 +3803,11 @@ static void gpu_encode_experts_batched(
     id<MTLCommandBuffer> cmdbuf,
     int K,                       // number of experts to encode
     const int *valid,            // which experts are valid [MAX_K]
-    id<MTLBuffer> __strong *expert_bufs   // per-expert weight data buffers [MAX_K]
+    id<MTLBuffer> __strong *expert_bufs,  // per-expert weight data buffers [MAX_K]
+    int layer_idx,               // layer index (for tiered per-expert quant)
+    const int *expert_indices    // expert indices (for tiered per-expert quant)
 ) {
+    // Default quant kind (used when not tiered, or for initial pipe selection)
     ExpertQuantKind quant_kind = active_expert_quant_kind();
     ExpertLayout layout = expert_layout_for_kind(quant_kind);
     id<MTLComputePipelineState> gate_pipe = expert_pipe_for_projection(ctx, quant_kind, layout.gate_kind);
@@ -3229,6 +3826,18 @@ static void gpu_encode_experts_batched(
     // Within each encoder, operations serialize (gate then up, SwiGLU then down).
     for (int k = 0; k < K; k++) {
         if (!valid[k]) continue;
+
+        // Per-expert quant override for tiered mode
+        if (g_use_tiered && g_tiered_manifest && expert_indices) {
+            ExpertQuantKind ek = tiered_expert_quant_kind(layer_idx, expert_indices[k]);
+            if (ek != quant_kind) {
+                layout = expert_layout_for_kind(ek);
+                gate_pipe = expert_pipe_for_projection(ctx, ek, layout.gate_kind);
+                up_pipe = expert_pipe_for_projection(ctx, ek, layout.up_kind);
+                down_pipe = expert_pipe_for_projection(ctx, ek, layout.down_kind);
+                quant_kind = ek;
+            }
+        }
 
         // Encoder A: gate_proj + up_proj (both read same input, write different outputs)
         {
@@ -3568,9 +4177,14 @@ typedef struct {
 
 static KVCache *kv_cache_new(void) {
     KVCache *c = calloc(1, sizeof(KVCache));
-    c->k_cache = calloc(MAX_SEQ_LEN * NUM_KV_HEADS * HEAD_DIM, sizeof(float));
-    c->v_cache = calloc(MAX_SEQ_LEN * NUM_KV_HEADS * HEAD_DIM, sizeof(float));
+    int seq = g_kv_seq_len;
+    c->k_cache = calloc((size_t)seq * NUM_KV_HEADS * HEAD_DIM, sizeof(float));
+    c->v_cache = calloc((size_t)seq * NUM_KV_HEADS * HEAD_DIM, sizeof(float));
     c->len = 0;
+    if (!c->k_cache || !c->v_cache) {
+        fprintf(stderr, "ERROR: KV cache alloc failed (seq=%d, %.1f MB each)\n",
+                seq, (double)seq * NUM_KV_HEADS * HEAD_DIM * sizeof(float) / 1e6);
+    }
     return c;
 }
 
@@ -4743,12 +5357,12 @@ typedef struct {
 static AsyncPreadState g_async_pread = {0};
 
 static void async_pread_start(int packed_fd, int *expert_indices, int K,
-                               id<MTLBuffer> __strong *dst_bufs, const void *mmap_base) {
+                               id<MTLBuffer> __strong *dst_bufs, const void *mmap_base,
+                               int layer_idx) {
     (void)mmap_base;
     size_t esz = active_expert_size();
     int chunks = active_cache_io_split(esz);
     const size_t page_bytes = 16 * 1024;
-    size_t total_pages = (chunks > 1) ? (esz / page_bytes) : 0;
 
     g_async_pread.num_experts = K;
     g_async_pread.chunks_per_expert = chunks;
@@ -4756,11 +5370,24 @@ static void async_pread_start(int packed_fd, int *expert_indices, int K,
     g_async_pread.active = 1;
 
     for (int k = 0; k < K; k++) {
+        // Per-expert offset and size (tiered: variable, uniform: computed from index)
+        size_t this_esz;
+        off_t this_offset;
+        if (g_use_tiered && g_tiered_manifest) {
+            TieredExpertInfo *ti = &TIERED(layer_idx, expert_indices[k]);
+            this_esz = ti->size;
+            this_offset = (off_t)ti->offset;
+        } else {
+            this_esz = esz;
+            this_offset = (off_t)expert_indices[k] * esz;
+        }
+
+        size_t total_pages = (chunks > 1) ? (this_esz / page_bytes) : 0;
         char *dst_base = (char *)[dst_bufs[k] contents];
         size_t page_cursor = 0;
         for (int c = 0; c < chunks; c++) {
             size_t chunk_off = 0;
-            size_t chunk_sz = esz;
+            size_t chunk_sz = this_esz;
             if (chunks > 1) {
                 size_t pages_this_chunk = total_pages / (size_t)chunks;
                 if ((size_t)c < (total_pages % (size_t)chunks)) pages_this_chunk++;
@@ -4772,7 +5399,7 @@ static void async_pread_start(int packed_fd, int *expert_indices, int K,
             int task_idx = k * chunks + c;
             g_async_pread.tasks[task_idx].fd = packed_fd;
             g_async_pread.tasks[task_idx].dst = dst_base + chunk_off;
-            g_async_pread.tasks[task_idx].offset = (off_t)expert_indices[k] * esz + (off_t)chunk_off;
+            g_async_pread.tasks[task_idx].offset = this_offset + (off_t)chunk_off;
             g_async_pread.tasks[task_idx].size = chunk_sz;
             g_async_pread.tasks[task_idx].result = 0;
             g_async_pread.tasks[task_idx].mmap_base = NULL;
@@ -4912,7 +5539,7 @@ typedef struct {
     int max_entries;
     int num_entries;
     int used_entries;
-    int entry_idx[NUM_LAYERS][NUM_EXPERTS];
+    int entry_idx[MAX_LAYERS][MAX_EXPERTS];
     uint64_t access_counter; // monotonic, incremented on every access
     id<MTLDevice> device;    // for allocating new Metal buffers
     // Stats
@@ -5070,7 +5697,7 @@ typedef struct {
     int max_entries;
     int num_entries;
     int used_entries;
-    int entry_idx[NUM_LAYERS][NUM_EXPERTS];
+    int entry_idx[MAX_LAYERS][MAX_EXPERTS];
     uint64_t access_counter;
     uint64_t hits;
     uint64_t misses;
@@ -5351,6 +5978,9 @@ typedef struct {
     uint8_t qkv_kind;
     uint8_t z_kind;
     uint8_t out_proj_kind;
+    uint8_t sg_kind;
+    uint8_t su_kind;
+    uint8_t sd_kind;
     uint8_t q_source;
     uint8_t k_source;
     uint8_t v_source;
@@ -5358,6 +5988,9 @@ typedef struct {
     uint8_t qkv_source;
     uint8_t z_source;
     uint8_t out_proj_source;
+    uint8_t sg_source;
+    uint8_t su_source;
+    uint8_t sd_source;
     // Input/post-attention layer norms
     uint16_t *input_norm_w;
     uint16_t *post_attn_norm_w;
@@ -5388,7 +6021,7 @@ typedef struct {
     uint32_t *seg_w;  uint16_t *seg_s, *seg_b; // shared_expert_gate
 } LayerWeightCache;
 
-static LayerWeightCache layer_cache[NUM_LAYERS];
+static LayerWeightCache layer_cache[MAX_LAYERS];
 static int layer_cache_built = 0;
 
 static void build_layer_cache(WeightFile *wf) {
@@ -5521,18 +6154,33 @@ static void build_layer_cache(WeightFile *wf) {
         lc->gate_b = get_tensor_ptr(wf, name);
         snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.weight", i);
         lc->sg_w = get_tensor_ptr(wf, name);
+        if (wf->gguf_shared_gate_layers[i]) {
+            lc->sg_w = (uint32_t *)wf->gguf_shared_gate_layers[i];
+            lc->sg_kind = MATVEC_KIND_GGUF_Q8_0;
+            lc->sg_source = MATVEC_SOURCE_GGUF_SHARED;
+        }
         snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.scales", i);
         lc->sg_s = get_tensor_ptr(wf, name);
         snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.biases", i);
         lc->sg_b = get_tensor_ptr(wf, name);
         snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.up_proj.weight", i);
         lc->su_w = get_tensor_ptr(wf, name);
+        if (wf->gguf_shared_up_layers[i]) {
+            lc->su_w = (uint32_t *)wf->gguf_shared_up_layers[i];
+            lc->su_kind = MATVEC_KIND_GGUF_Q8_0;
+            lc->su_source = MATVEC_SOURCE_GGUF_SHARED;
+        }
         snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.up_proj.scales", i);
         lc->su_s = get_tensor_ptr(wf, name);
         snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.up_proj.biases", i);
         lc->su_b = get_tensor_ptr(wf, name);
         snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.weight", i);
         lc->sd_w = get_tensor_ptr(wf, name);
+        if (wf->gguf_shared_down_layers[i]) {
+            lc->sd_w = (uint32_t *)wf->gguf_shared_down_layers[i];
+            lc->sd_kind = MATVEC_KIND_GGUF_Q8_0;
+            lc->sd_source = MATVEC_SOURCE_GGUF_SHARED;
+        }
         snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.scales", i);
         lc->sd_s = get_tensor_ptr(wf, name);
         snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.biases", i);
@@ -5565,7 +6213,7 @@ typedef struct {
     float expert_weights[MAX_K];        // routing weights for weighted accumulation
     int valid[MAX_K];                   // which experts loaded successfully
     int actual_K;                       // number of experts
-    float h_mid[HIDDEN_DIM];            // saved h_mid for final combine
+    float h_mid[MAX_HIDDEN_DIM];        // saved h_mid for final combine
     float shared_gate_score;            // saved shared expert gate score
     float *hidden;                      // pointer to hidden state (for writing final result)
     int layer_idx;                      // which layer produced this deferred state
@@ -5834,7 +6482,7 @@ static void fused_layer_forward(
                           g_metal->conv1d_step && g_metal->rms_norm_qk &&
                           g_metal->compute_decay_beta && g_metal->gated_rms_norm &&
                           g_metal->wf_buf &&
-                          linear_layer_idx >= 0 && linear_layer_idx < NUM_LINEAR_LAYERS &&
+                          linear_layer_idx >= 0 && linear_layer_idx < g_cfg.num_linear_layers &&
                           lc->conv1d_w && lc->A_log && lc->dt_bias && lc->gated_norm_w &&
                           !attn_specs_have_q8 &&
                           !linear_attn_bypass);
@@ -5969,7 +6617,7 @@ static void fused_layer_forward(
             g_metal->buf_multi_expert_data_B[0] && g_pred_count[layer_idx] > 0) {
             async_pread_start(packed_fd, g_pred_experts[layer_idx],
                               g_pred_count[layer_idx],
-                              g_metal->buf_multi_expert_data_B, mmap_base);
+                              g_metal->buf_multi_expert_data_B, mmap_base, layer_idx);
             pred_started = 1;
         }
         // Set up residual for CMD2 (residual = hidden before this layer's attention)
@@ -6233,6 +6881,16 @@ static void fused_layer_forward(
     uint32_t *suw = lc->su_w;     uint16_t *sus = lc->su_s,       *sub = lc->su_b;
     uint32_t *seg_w = lc->seg_w;  uint16_t *seg_s = lc->seg_s,   *seg_b = lc->seg_b;
     uint32_t *sdw = lc->sd_w;     uint16_t *sds = lc->sd_s,       *sdb = lc->sd_b;
+    uint8_t sg_kind = lc->sg_kind;
+    uint8_t su_kind = lc->su_kind;
+    uint8_t sd_kind = lc->sd_kind;
+    uint8_t sg_source = lc->sg_source;
+    uint8_t su_source = lc->su_source;
+    uint8_t sd_source = lc->sd_source;
+    int shared_override_active =
+        (sg_source == MATVEC_SOURCE_GGUF_SHARED) ||
+        (su_source == MATVEC_SOURCE_GGUF_SHARED) ||
+        (sd_source == MATVEC_SOURCE_GGUF_SHARED);
 
     // ---- CPU attention compute (produces attn_out for o_proj) ----
     float *attn_out_for_oproj = NULL;
@@ -6281,11 +6939,20 @@ static void fused_layer_forward(
         // Update KV cache (CPU + GPU mirror)
         int cache_pos = kv->len;
         full_attn_seq_pos = cache_pos;
+        if (!kv->k_cache || !kv->v_cache) {
+            fprintf(stderr, "ERROR: KV cache is NULL (alloc failed)\n");
+            return;
+        }
+        if (cache_pos >= g_kv_seq_len) {
+            fprintf(stderr, "ERROR: KV cache overflow (pos=%d >= max=%d)\n", cache_pos, g_kv_seq_len);
+            return;
+        }
         memcpy(kv->k_cache + cache_pos * kv_dim, k_out, kv_dim * sizeof(float));
         memcpy(kv->v_cache + cache_pos * kv_dim, v_out, kv_dim * sizeof(float));
 
         int fa_idx = (layer_idx + 1) / FULL_ATTN_INTERVAL - 1;
-        if (g_metal && g_metal->attn_scores_pipe && fa_idx >= 0 && fa_idx < NUM_FULL_ATTN_LAYERS) {
+        if (g_metal && g_metal->attn_scores_pipe && fa_idx >= 0 && fa_idx < g_cfg.num_full_attn_layers
+            && cache_pos < g_gpu_kv_seq) {
             memcpy((float *)[g_metal->buf_kv_k[fa_idx] contents] + cache_pos * kv_dim,
                    k_out, kv_dim * sizeof(float));
             memcpy((float *)[g_metal->buf_kv_v[fa_idx] contents] + cache_pos * kv_dim,
@@ -6303,8 +6970,8 @@ static void fused_layer_forward(
         // Only enabled when seq_len >= 32 (below that, CPU is faster).
         int gpu_attn_ready = (g_metal && g_metal->attn_scores_pipe &&
                               lc->o_kind != MATVEC_KIND_GGUF_Q8_0 &&
-                              fa_idx >= 0 && fa_idx < NUM_FULL_ATTN_LAYERS &&
-                              kv->len >= 32 && kv->len < GPU_KV_SEQ);
+                              fa_idx >= 0 && fa_idx < g_cfg.num_full_attn_layers &&
+                              kv->len >= 32 && kv->len < g_gpu_kv_seq);
 
         if (gpu_attn_ready) {
             // Copy Q and gate to GPU; attention dispatches will be in CMD2
@@ -6414,7 +7081,7 @@ static void fused_layer_forward(
 
             // GPU delta-net path (falls back to CPU if pipeline unavailable)
             if (g_metal && g_metal->delta_net_step &&
-                linear_layer_idx >= 0 && linear_layer_idx < NUM_LINEAR_LAYERS) {
+                linear_layer_idx >= 0 && linear_layer_idx < g_cfg.num_linear_layers) {
                 // Upload CPU-computed data to GPU scratch buffers
                 memcpy([g_metal->buf_delta_q contents], lin_q, LINEAR_TOTAL_KEY * sizeof(float));
                 memcpy([g_metal->buf_delta_k contents], lin_k, LINEAR_TOTAL_KEY * sizeof(float));
@@ -6538,17 +7205,20 @@ static void fused_layer_forward(
     float shared_gate_score = 0.0f;
     int used_fused_cmd2 = 0;
 
-    int have_moe_weights = (gate_w && gate_s && gate_b && sgw && sgs && sgb &&
-                            suw && sus && sub && seg_w && seg_s && seg_b);
+    int shared_gate_ok = (sgw && ((sg_kind == MATVEC_KIND_GGUF_Q8_0) || (sgs && sgb)));
+    int shared_up_ok = (suw && ((su_kind == MATVEC_KIND_GGUF_Q8_0) || (sus && sub)));
+    int have_moe_weights = (gate_w && gate_s && gate_b &&
+                            shared_gate_ok && shared_up_ok &&
+                            seg_w && seg_s && seg_b);
 
     // gpu_attn_fuse: attention dispatches fused into CMD2 (full-attn layers only).
     // Only enabled when seq_len >= 32 — below that, CPU attention is faster
     // because GPU command encoder overhead dominates at short sequences.
     int gpu_attn_fuse = (is_full && lc->o_kind != MATVEC_KIND_GGUF_Q8_0 &&
                          !attn_out_for_oproj && g_metal && g_metal->attn_scores_pipe
-                         && kv && kv->len >= 32 && kv->len < GPU_KV_SEQ);
+                         && kv && kv->len >= 32 && kv->len < g_gpu_kv_seq);
 
-    int disable_fused_cmd2 = full_attn_force_cmd2_fallback();
+    int disable_fused_cmd2 = full_attn_force_cmd2_fallback() || shared_override_active;
 
     if (!disable_fused_cmd2 &&
         (attn_out_for_oproj || gpu_attn_fuse) && oproj_w &&
@@ -6596,7 +7266,7 @@ static void fused_layer_forward(
             uint32_t hd = HEAD_DIM;
             uint32_t kvd = (uint32_t)kv_dim;
             uint32_t sl = (uint32_t)kv->len;
-            uint32_t seq_stride = GPU_KV_SEQ;
+            uint32_t seq_stride = (uint32_t)g_gpu_kv_seq;
             uint32_t hpkv = (uint32_t)heads_per_kv;
 
             // Enc A1: attn_scores_batched
@@ -6818,10 +7488,10 @@ static void fused_layer_forward(
         // Routing + shared expert batch
         if (have_moe_weights) {
             BatchMatvecSpec moe_specs[4] = {
-                { gate_w, gate_s, gate_b, gate_scores,        (uint32_t)NUM_EXPERTS,        HIDDEN_DIM, GROUP_SIZE, 0 },
-                { sgw,    sgs,    sgb,    shared_gate,         (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 1 },
-                { suw,    sus,    sub,    shared_up,           (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 2 },
-                { seg_w,  seg_s,  seg_b,  &shared_gate_score,  1,                            HIDDEN_DIM, GROUP_SIZE, 3 },
+                { gate_w, gate_s, gate_b, gate_scores,        (uint32_t)NUM_EXPERTS,        HIDDEN_DIM, GROUP_SIZE, 0, MATVEC_KIND_MLX4,        MATVEC_SOURCE_WF },
+                { sgw,    sgs,    sgb,    shared_gate,         (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 1, sg_kind,                 sg_source },
+                { suw,    sus,    sub,    shared_up,           (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 2, su_kind,                 su_source },
+                { seg_w,  seg_s,  seg_b,  &shared_gate_score,  1,                            HIDDEN_DIM, GROUP_SIZE, 3, MATVEC_KIND_MLX4,        MATVEC_SOURCE_WF },
             };
             fast_batch_matvec(h_post, HIDDEN_DIM, moe_specs, 4);
         }
@@ -7070,7 +7740,7 @@ static void fused_layer_forward(
         } else {
             // ---- No cache, no prediction, no LZ4: ASYNC parallel pread ----
             async_pread_start(packed_fd, expert_indices, actual_K,
-                              g_metal->buf_multi_expert_data, mmap_base);
+                              g_metal->buf_multi_expert_data, mmap_base, layer_idx);
             for (int k = 0; k < actual_K; k++) {
                 expert_bufs[k] = g_metal->buf_multi_expert_data[k];
             }
@@ -7107,37 +7777,51 @@ static void fused_layer_forward(
 
         if (g_timing_enabled) { t0 = now_ms(); }
 
+        if (shared_override_active) {
+            float *shared_act = calloc(SHARED_INTERMEDIATE, sizeof(float));
+            cpu_swiglu(shared_gate, shared_up, shared_act, SHARED_INTERMEDIATE);
+            if (sdw) {
+                fast_kind_matvec(sdw, sds, sdb, sd_kind, sd_source,
+                                 shared_act, shared_out,
+                                 HIDDEN_DIM, SHARED_INTERMEDIATE, GROUP_SIZE);
+                memcpy([g_metal->buf_shared_out contents], shared_out, HIDDEN_DIM * sizeof(float));
+            }
+            free(shared_act);
+        }
+
         // Step 3: encode ALL experts + shared expert into ONE command buffer.
         // Batched encoding: 4 encoders for K experts + 2 for shared = 6 total
         // (vs. 4*K + 2 = 18 with old per-expert encoding).
         id<MTLCommandBuffer> cmd_experts = [g_metal->queue commandBuffer];
 
-        gpu_encode_experts_batched(g_metal, cmd_experts, actual_K, valid, expert_bufs);
+        gpu_encode_experts_batched(g_metal, cmd_experts, actual_K, valid, expert_bufs,
+                                   layer_idx, expert_indices);
 
         // Shared expert SwiGLU + down_proj (2 more encoders)
         // Note: shared_gate/up already copied to GPU buffers above (before async pread wait)
+        if (!shared_override_active) {
+            // SwiGLU dispatch
+            {
+                id<MTLComputeCommandEncoder> enc = [cmd_experts computeCommandEncoder];
+                [enc setComputePipelineState:g_metal->swiglu];
+                [enc setBuffer:g_metal->buf_shared_gate offset:0 atIndex:0];
+                [enc setBuffer:g_metal->buf_shared_up   offset:0 atIndex:1];
+                [enc setBuffer:g_metal->buf_shared_act  offset:0 atIndex:2];
+                uint32_t dim = SHARED_INTERMEDIATE;
+                [enc setBytes:&dim length:4 atIndex:3];
+                uint32_t swiglu_tgs = (dim + 255) / 256;
+                [enc dispatchThreadgroups:MTLSizeMake(swiglu_tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }
 
-        // SwiGLU dispatch
-        {
-            id<MTLComputeCommandEncoder> enc = [cmd_experts computeCommandEncoder];
-            [enc setComputePipelineState:g_metal->swiglu];
-            [enc setBuffer:g_metal->buf_shared_gate offset:0 atIndex:0];
-            [enc setBuffer:g_metal->buf_shared_up   offset:0 atIndex:1];
-            [enc setBuffer:g_metal->buf_shared_act  offset:0 atIndex:2];
-            uint32_t dim = SHARED_INTERMEDIATE;
-            [enc setBytes:&dim length:4 atIndex:3];
-            uint32_t swiglu_tgs = (dim + 255) / 256;
-            [enc dispatchThreadgroups:MTLSizeMake(swiglu_tgs, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-            [enc endEncoding];
-        }
-
-        // Shared down_proj dispatch
-        if (sdw && sds && sdb) {
-            gpu_encode_dequant_matvec_with_io_bufs(
-                g_metal, cmd_experts, sdw, sds, sdb,
-                g_metal->buf_shared_act, g_metal->buf_shared_out,
-                HIDDEN_DIM, SHARED_INTERMEDIATE, GROUP_SIZE);
+            // Shared down_proj dispatch
+            if (sdw && sds && sdb) {
+                gpu_encode_dequant_matvec_with_io_bufs(
+                    g_metal, cmd_experts, sdw, sds, sdb,
+                    g_metal->buf_shared_act, g_metal->buf_shared_out,
+                    HIDDEN_DIM, SHARED_INTERMEDIATE, GROUP_SIZE);
+            }
         }
 
         // Step 4: GPU-side combine + residual + norm (if not last layer)
@@ -7152,7 +7836,8 @@ static void fused_layer_forward(
         // This makes CMD3 self-contained: it produces buf_input for the next layer's CMD1.
         // The next layer skips deferred_wait + finalize + input_norm entirely at layer start.
 
-        int gpu_combine = (g_metal->moe_combine_residual &&
+        int gpu_combine = (!shared_override_active &&
+                           g_metal->moe_combine_residual &&
                            g_metal->rms_norm_sum &&
                            g_metal->rms_norm_apply_bf16 &&
                            g_metal->wf_buf &&
@@ -7299,18 +7984,20 @@ static void fused_layer_forward(
         // CPU shared expert
         float *shared_act = calloc(SHARED_INTERMEDIATE, sizeof(float));
         cpu_swiglu(shared_gate, shared_up, shared_act, SHARED_INTERMEDIATE);
-        if (sdw && sds && sdb) {
-            cpu_dequant_matvec(sdw, sds, sdb, shared_act, shared_out,
-                               HIDDEN_DIM, SHARED_INTERMEDIATE, GROUP_SIZE);
+        if (sdw) {
+            fast_kind_matvec(sdw, sds, sdb, sd_kind, sd_source,
+                             shared_act, shared_out,
+                             HIDDEN_DIM, SHARED_INTERMEDIATE, GROUP_SIZE);
         }
         free(shared_act);
     } else {
         // No experts available -- still need shared expert
         float *shared_act = calloc(SHARED_INTERMEDIATE, sizeof(float));
         cpu_swiglu(shared_gate, shared_up, shared_act, SHARED_INTERMEDIATE);
-        if (sdw && sds && sdb) {
-            fast_dequant_matvec(sdw, sds, sdb, shared_act, shared_out,
-                                HIDDEN_DIM, SHARED_INTERMEDIATE, GROUP_SIZE);
+        if (sdw) {
+            fast_kind_matvec(sdw, sds, sdb, sd_kind, sd_source,
+                             shared_act, shared_out,
+                             HIDDEN_DIM, SHARED_INTERMEDIATE, GROUP_SIZE);
         }
         free(shared_act);
     }
@@ -7745,7 +8432,7 @@ static void sync_cpu_to_gpu_delta_state_serve(void **layer_states) {
         if ((i + 1) % FULL_ATTN_INTERVAL == 0) continue;
         if (!layer_states[i]) { li++; continue; }
         LinearAttnState *la = (LinearAttnState *)layer_states[i];
-        if (li < NUM_LINEAR_LAYERS) {
+        if (li < g_cfg.num_linear_layers) {
             if (g_metal->buf_delta_state[li] && la->ssm_state)
                 memcpy([g_metal->buf_delta_state[li] contents], la->ssm_state,
                        LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM * LINEAR_KEY_DIM * sizeof(float));
@@ -7895,12 +8582,12 @@ static void serve_loop(
         }
     }
     // Also snapshot GPU delta-net state
-    void *gpu_delta_snapshots[NUM_LINEAR_LAYERS];
-    void *gpu_conv_snapshots[NUM_LINEAR_LAYERS];
+    void *gpu_delta_snapshots[48];
+    void *gpu_conv_snapshots[48];
     memset(gpu_delta_snapshots, 0, sizeof(gpu_delta_snapshots));
     memset(gpu_conv_snapshots, 0, sizeof(gpu_conv_snapshots));
     if (g_metal && g_metal->delta_net_step) {
-        for (int i = 0; i < NUM_LINEAR_LAYERS; i++) {
+        for (int i = 0; i < g_cfg.num_linear_layers; i++) {
             if (g_metal->buf_delta_state[i]) {
                 size_t sz = 64*128*128*sizeof(float);
                 gpu_delta_snapshots[i] = malloc(sz);
@@ -8051,7 +8738,7 @@ static void serve_loop(
                         // Also restore GPU KV mirror
                         if (g_metal) {
                             int fa_idx = (i + 1) / FULL_ATTN_INTERVAL - 1;
-                            if (fa_idx >= 0 && fa_idx < NUM_FULL_ATTN_LAYERS) {
+                            if (fa_idx >= 0 && fa_idx < g_cfg.num_full_attn_layers) {
                                 memcpy([g_metal->buf_kv_k[fa_idx] contents],
                                        kv_snapshots[i].k_snapshot, sz);
                                 memcpy([g_metal->buf_kv_v[fa_idx] contents],
@@ -8073,7 +8760,7 @@ static void serve_loop(
                 }
                 // Restore GPU delta-net state
                 if (g_metal && g_metal->delta_net_step) {
-                    for (int i = 0; i < NUM_LINEAR_LAYERS; i++) {
+                    for (int i = 0; i < g_cfg.num_linear_layers; i++) {
                         if (gpu_delta_snapshots[i] && g_metal->buf_delta_state[i])
                             memcpy([g_metal->buf_delta_state[i] contents],
                                    gpu_delta_snapshots[i], 64*128*128*sizeof(float));
@@ -8303,6 +8990,8 @@ static void print_usage(const char *prog) {
     printf("  --gguf-qkv-json PATH Optional qkv family manifest JSON\n");
     printf("  --gguf-linear-bin PATH Optional raw Q8_0 linear gate/out overlay blob\n");
     printf("  --gguf-linear-json PATH Optional linear gate/out overlay manifest JSON\n");
+    printf("  --gguf-shared-bin PATH Optional raw Q8_0 shared-expert overlay blob\n");
+    printf("  --gguf-shared-json PATH Optional shared-expert overlay manifest JSON\n");
     printf("  --vocab PATH         vocab.bin path\n");
     printf("  --prompt-tokens PATH prompt_tokens.bin path\n");
     printf("  --prompt TEXT         Prompt text (requires encode_prompt.py)\n");
@@ -8332,6 +9021,9 @@ static void print_usage(const char *prog) {
 
 int main(int argc, char **argv) {
     @autoreleasepool {
+        // Initialize model config with 397B defaults
+        config_init_defaults();
+
         const char *model_path = MODEL_PATH_DEFAULT;
         const char *weights_path = NULL;
         const char *manifest_path = NULL;
@@ -8343,6 +9035,8 @@ int main(int argc, char **argv) {
         const char *gguf_linear_bin_path = NULL;
         const char *gguf_linear_json_path = NULL;
         const char *gguf_lm_head_path = NULL;
+        const char *gguf_shared_bin_path = NULL;
+        const char *gguf_shared_json_path = NULL;
         const char *vocab_path = NULL;
         const char *prompt_tokens_path = NULL;
         const char *prompt_text = NULL;
@@ -8365,6 +9059,8 @@ int main(int argc, char **argv) {
             {"gguf-linear-bin", required_argument, 0, 'U'},
             {"gguf-linear-json", required_argument, 0, 'V'},
             {"gguf-lm-head",  required_argument, 0, 'Y'},
+            {"gguf-shared-bin", required_argument, 0, 'H'},
+            {"gguf-shared-json", required_argument, 0, 'i'},
             {"vocab",         required_argument, 0, 'v'},
             {"prompt-tokens", required_argument, 0, 'p'},
             {"prompt",        required_argument, 0, 'P'},
@@ -8379,6 +9075,7 @@ int main(int argc, char **argv) {
             {"cache-telemetry", no_argument,     0, 'E'},
             {"cache-io-split", required_argument, 0, 'W'},
             {"2bit",          no_argument,       0, '2'},
+            {"tiered",        no_argument,       0, '4'},
             {"q3-experts",    no_argument,       0, '3'},
             {"gpu-linear",    no_argument,       0, 'G'},
             {"think-budget",  required_argument, 0, 'B'},
@@ -8394,7 +9091,7 @@ int main(int argc, char **argv) {
         };
 
         int c;
-        while ((c = getopt_long(argc, argv, "m:w:j:I:A:N:J:K:U:V:Y:v:p:P:t:k:C:M:R:B:LSTFEW:23Gh", long_options, NULL)) != -1) {
+        while ((c = getopt_long(argc, argv, "m:w:j:I:A:N:J:K:U:V:Y:H:i:v:p:P:t:k:C:M:R:B:LSTFEW:23Gh", long_options, NULL)) != -1) {
             switch (c) {
                 case 'm': model_path = optarg; break;
                 case 'w': weights_path = optarg; break;
@@ -8407,6 +9104,8 @@ int main(int argc, char **argv) {
                 case 'U': gguf_linear_bin_path = optarg; break;
                 case 'V': gguf_linear_json_path = optarg; break;
                 case 'Y': gguf_lm_head_path = optarg; break;
+                case 'H': gguf_shared_bin_path = optarg; break;
+                case 'i': gguf_shared_json_path = optarg; break;
                 case 'v': vocab_path = optarg; break;
                 case 'p': prompt_tokens_path = optarg; break;
                 case 'P': prompt_text = optarg; break;
@@ -8421,6 +9120,7 @@ int main(int argc, char **argv) {
                 case 'E': g_cache_telemetry_enabled = 1; break;
                 case 'W': g_cache_io_split = atoi(optarg); break;
                 case '2': g_use_2bit = 1; break;
+                case '4': g_use_tiered = 1; break;
                 case '3': g_use_q3_experts = 1; break;
                 case 'G': gpu_linear_attn_enabled = 1; break;
                 case 'D': g_pred_enabled = 1; break;
@@ -8493,6 +9193,24 @@ int main(int argc, char **argv) {
         // Set model path for tokenizer lookup
         g_model_path_for_tokenizer = model_path;
 
+        // ---- Load model config ----
+        // Try config.json first (standalone model packages), then model_weights.json
+        load_config_from_config_json(model_path);
+        if (manifest_path) load_config_from_manifest(manifest_path);
+
+        // Update K from config (unless explicitly overridden via --k)
+        // The 397B model uses K=4 (actual active) despite num_experts_per_tok=10 in config
+        // Other models (35B) use K=8. Auto-set K from config, capped to MAX_K.
+        {
+            int config_k = g_cfg.num_experts_per_tok;
+            if (config_k > MAX_K) config_k = MAX_K;
+            // Only override if user didn't explicitly set K via --k
+            // (we detect this by checking if K is still the default 4)
+            if (K == 4 && config_k != 4) {
+                K = config_k;
+            }
+        }
+
         // ---- Initialize Metal ----
         g_metal = metal_setup();
         if (!g_metal) {
@@ -8532,6 +9250,9 @@ int main(int argc, char **argv) {
             }
             if (gguf_lm_head_path) {
                 printf("LM Head:  %s\n", gguf_lm_head_path);
+            }
+            if (gguf_shared_bin_path) {
+                printf("SharedOv: %s\n", gguf_shared_bin_path);
             }
             printf("Vocab:    %s\n", vocab_path);
             printf("K:        %d experts/layer\n", K);
@@ -8587,6 +9308,11 @@ int main(int argc, char **argv) {
             fprintf(stderr, "ERROR: Failed to attach GGUF LM head\n");
             return 1;
         }
+        if (gguf_shared_bin_path &&
+            !attach_gguf_shared_overlay(wf, gguf_shared_bin_path, gguf_shared_json_path)) {
+            fprintf(stderr, "ERROR: Failed to attach GGUF shared overlay\n");
+            return 1;
+        }
 
         // Wrap weight file for Metal GPU access
         if (g_metal) {
@@ -8602,6 +9328,9 @@ int main(int argc, char **argv) {
             }
             if (wf->gguf_lm_head_data) {
                 metal_set_gguf_lm_head(g_metal, wf->gguf_lm_head_data, wf->gguf_lm_head_size);
+            }
+            if (wf->gguf_shared_data) {
+                metal_set_gguf_shared(g_metal, wf->gguf_shared_data, wf->gguf_shared_size);
             }
         }
 
@@ -8644,8 +9373,25 @@ int main(int argc, char **argv) {
             printf("\n");
         }
 
+        // ---- Auto-detect tiered experts ----
+        if (!g_use_2bit && !g_use_q3_experts && !g_use_tiered) {
+            char probe[1024];
+            snprintf(probe, sizeof(probe), "%s/packed_experts_tiered/tiered_manifest.json", model_path);
+            if (access(probe, F_OK) == 0) {
+                if (load_tiered_manifest(model_path)) {
+                    g_use_tiered = 1;
+                }
+            }
+        }
+        if (g_use_tiered && !g_tiered_manifest) {
+            if (!load_tiered_manifest(model_path)) {
+                fprintf(stderr, "ERROR: Tiered mode requested but no manifest found\n");
+                return 1;
+            }
+        }
+
         // ---- Auto-detect 2-bit experts ----
-        if (!g_use_2bit && !g_use_q3_experts) {
+        if (!g_use_2bit && !g_use_q3_experts && !g_use_tiered) {
             char probe[1024];
             snprintf(probe, sizeof(probe), "%s/packed_experts_2bit/layer_00.bin", model_path);
             int pfd = open(probe, O_RDONLY);
@@ -8669,11 +9415,29 @@ int main(int argc, char **argv) {
         // Seen-expert bitset tracks which (layer, expert) pairs have been read before.
         // First read goes through cold fd (no page cache pollution).
         // Subsequent reads go through warm fd (page cache hit = 32 GB/s vs 5.5 GB/s).
-        int layer_fds[NUM_LAYERS];
-        int layer_fds_cold[NUM_LAYERS];
-        void *layer_mmaps[NUM_LAYERS];
-        size_t layer_mmap_sizes[NUM_LAYERS];
+        int layer_fds[MAX_LAYERS];
+        int layer_fds_cold[MAX_LAYERS];
+        void *layer_mmaps[MAX_LAYERS];
+        size_t layer_mmap_sizes[MAX_LAYERS];
         int expert_layers_available = 0;
+
+        // Auto-detect expert size from first layer file
+        {
+            char probe[1024];
+            snprintf(probe, sizeof(probe), "%s/packed_experts/layer_00.bin", model_path);
+            struct stat st;
+            if (stat(probe, &st) == 0 && st.st_size > 0 && NUM_EXPERTS > 0) {
+                size_t detected = st.st_size / NUM_EXPERTS;
+                if (detected != g_cfg.expert_size_computed) {
+                    fprintf(stderr, "[experts] WARNING: file-detected expert size %zu != computed %zu, using file\n",
+                            detected, g_cfg.expert_size_computed);
+                    g_cfg.expert_size_computed = detected;
+                }
+                if (!g_stream_mode)
+                    printf("[experts] Expert size: %zu bytes (%.2f MB)\n",
+                           g_cfg.expert_size_computed, g_cfg.expert_size_computed / 1e6);
+            }
+        }
 
         // Reset the global seen-expert bitset
         memset(g_expert_seen, 0, sizeof(g_expert_seen));
@@ -8687,7 +9451,10 @@ int main(int argc, char **argv) {
             char path[1024];
             layer_fds[i] = -1;
 
-            if (g_use_q3_experts) {
+            if (g_use_tiered) {
+                snprintf(path, sizeof(path), "%s/packed_experts_tiered/layer_%02d.bin", model_path, i);
+                layer_fds[i] = open(path, O_RDONLY);
+            } else if (g_use_q3_experts) {
                 snprintf(path, sizeof(path), "%s/packed_experts_Q3/layer_%02d.bin", model_path, i);
                 layer_fds[i] = open(path, O_RDONLY);
                 if (layer_fds[i] >= 0) {
@@ -8735,21 +9502,23 @@ int main(int argc, char **argv) {
                 // Disable readahead: expert reads are random (different offsets per token).
                 // Read-ahead prefetches adjacent data we won't use, wasting SSD bandwidth.
                 fcntl(layer_fds[i], F_RDAHEAD, 0);
-                struct stat st;
-                if (fstat(layer_fds[i], &st) == 0 && st.st_size > 0) {
-                    layer_mmaps[i] = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, layer_fds[i], 0);
-                    if (layer_mmaps[i] != MAP_FAILED) {
-                        layer_mmap_sizes[i] = st.st_size;
-                        // No madvise: kernel default is best.
-                        // MADV_RANDOM disables readahead (tested: hurts).
-                        // MADV_SEQUENTIAL doesn't reduce I/O fragmentation (tested: no effect).
-                        // The kernel fragments 3.9MB preads into ~5.7 disk ops regardless
-                        // of hints — this is inherent to the page cache's physical page layout.
+                if (g_cache_io_split <= 1) {
+                    // Only mmap when fanout is disabled — with cache-io-split the
+                    // pread fanout path is used exclusively and mmap just wastes
+                    // virtual address space (~163-209 GB) and adds VM overhead.
+                    struct stat st;
+                    if (fstat(layer_fds[i], &st) == 0 && st.st_size > 0) {
+                        layer_mmaps[i] = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, layer_fds[i], 0);
+                        if (layer_mmaps[i] != MAP_FAILED) {
+                            layer_mmap_sizes[i] = st.st_size;
+                        }
                     }
                 }
             }
         }
-        printf("[experts] %d/%d packed layer files available (mmap'd)\n", expert_layers_available, NUM_LAYERS);
+        printf("[experts] %d/%d packed layer files available (%s)\n",
+               expert_layers_available, NUM_LAYERS,
+               g_cache_io_split > 1 ? "pread fanout" : "mmap'd");
         if (g_use_q3_experts && layers_4bit > 0) {
             if (layers_q3_outlier > 0) {
                 printf("[mixed-quant] %d layers at Q3-GGUF, %d layers at Q3-outlier, %d layers at 4-bit\n",
