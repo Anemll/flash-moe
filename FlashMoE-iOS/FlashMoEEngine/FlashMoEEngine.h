@@ -131,6 +131,12 @@ void flashmoe_get_stats(FlashMoEContext *ctx, FlashMoEStats *stats);
 // Returns NULL on error.
 char *flashmoe_run_profile(FlashMoEContext *ctx, int num_tokens);
 
+// Enable timing accumulation (call before generate)
+void flashmoe_timing_enable(FlashMoEContext *ctx);
+
+// Build timing report string (call after generate). Caller must free().
+char *flashmoe_timing_report(FlashMoEContext *ctx);
+
 // ---- Utility ----
 
 // Check if a model directory is valid (has config.json, packed_experts/, etc.)

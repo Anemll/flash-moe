@@ -1881,7 +1881,7 @@ static PromptTokens *load_prompt_tokens(const char *path) {
 static bpe_tokenizer g_tokenizer;
 static int g_tokenizer_loaded = 0;
 
-static const char *g_model_path_for_tokenizer = NULL;
+static char *g_model_path_for_tokenizer = NULL;
 
 static void init_tokenizer(void) {
     if (g_tokenizer_loaded) return;
@@ -8844,10 +8844,7 @@ static void serve_loop(
 
             // ---- Final norm + LM head for first token ----
             if (final_norm_w) {
-                float *normed = malloc(HIDDEN_DIM * sizeof(float));
-                cpu_rms_norm(hidden, final_norm_w, normed, HIDDEN_DIM, RMS_NORM_EPS);
-                memcpy(hidden, normed, HIDDEN_DIM * sizeof(float));
-                free(normed);
+                cpu_rms_norm(hidden, final_norm_w, hidden, HIDDEN_DIM, RMS_NORM_EPS);
             }
             lm_head_forward(wf, hidden, logits);
             int next_token = cpu_argmax(logits, VOCAB_SIZE);
@@ -8925,10 +8922,7 @@ static void serve_loop(
                 pos++;
 
                 if (final_norm_w) {
-                    float *normed = malloc(HIDDEN_DIM * sizeof(float));
-                    cpu_rms_norm(hidden, final_norm_w, normed, HIDDEN_DIM, RMS_NORM_EPS);
-                    memcpy(hidden, normed, HIDDEN_DIM * sizeof(float));
-                    free(normed);
+                    cpu_rms_norm(hidden, final_norm_w, hidden, HIDDEN_DIM, RMS_NORM_EPS);
                 }
                 lm_head_forward(wf, hidden, logits);
                 next_token = cpu_argmax(logits, VOCAB_SIZE);
@@ -9649,6 +9643,7 @@ int main(int argc, char **argv) {
             double t_ppl_start = now_ms();
 
             for (int i = 0; i < gt->count; i++) {
+                @autoreleasepool {
                 // Embed token[i]
                 embed_lookup(wf, gt->ids[i], hidden);
 
@@ -9667,10 +9662,7 @@ int main(int argc, char **argv) {
 
                 // Score: compute cross-entropy for predicting token[i+1]
                 if (i < gt->count - 1) {
-                    float *normed = malloc(HIDDEN_DIM * sizeof(float));
-                    cpu_rms_norm(hidden, final_norm_w, normed, HIDDEN_DIM, RMS_NORM_EPS);
-                    memcpy(hidden, normed, HIDDEN_DIM * sizeof(float));
-                    free(normed);
+                    cpu_rms_norm(hidden, final_norm_w, hidden, HIDDEN_DIM, RMS_NORM_EPS);
 
                     lm_head_forward(wf, hidden, logits);
 
@@ -9690,6 +9682,7 @@ int main(int argc, char **argv) {
                                 tokens_scored, num_eval, avg_nll, exp(avg_nll), tok_s, eta_buf);
                     }
                 }
+                } // @autoreleasepool
             }
 
             double elapsed_s = (now_ms() - t_ppl_start) / 1000.0;
@@ -9745,6 +9738,7 @@ int main(int argc, char **argv) {
             for (int token_idx = 0; token_idx < pt->count - 1; token_idx++) {
                 double t_tok = now_ms();
 
+                @autoreleasepool {
                 // Load pre-embedded token from batch buffer
                 cache_telemetry_note_token();
                 memcpy(hidden, embed_batch + (size_t)token_idx * HIDDEN_DIM,
@@ -9765,6 +9759,7 @@ int main(int argc, char **argv) {
                 // by the next token's embedding. Only wait for GPU (buffer safety).
                 discard_deferred_experts();
                 pos++;
+                } // @autoreleasepool
 
                 if (token_idx == 0) {
                     first_tok_ms = now_ms() - t_tok;
@@ -9807,10 +9802,7 @@ int main(int argc, char **argv) {
 
         // ---- Final norm ----
         if (final_norm_w) {
-            float *normed = malloc(HIDDEN_DIM * sizeof(float));
-            cpu_rms_norm(hidden, final_norm_w, normed, HIDDEN_DIM, RMS_NORM_EPS);
-            memcpy(hidden, normed, HIDDEN_DIM * sizeof(float));
-            free(normed);
+            cpu_rms_norm(hidden, final_norm_w, hidden, HIDDEN_DIM, RMS_NORM_EPS);
         }
 
         // ---- LM head ----
@@ -9873,6 +9865,9 @@ int main(int argc, char **argv) {
             if (next_token == THINK_END_TOKEN) in_think = 0;
             if (in_think) think_tokens++;
 
+            // @autoreleasepool drains Metal command buffers each token
+            @autoreleasepool {
+
             // Embed the just-generated token (next iteration)
             cache_telemetry_note_token();
             embed_lookup(wf, next_token, hidden);
@@ -9893,10 +9888,7 @@ int main(int argc, char **argv) {
 
             // Final norm
             if (final_norm_w) {
-                float *normed = malloc(HIDDEN_DIM * sizeof(float));
-                cpu_rms_norm(hidden, final_norm_w, normed, HIDDEN_DIM, RMS_NORM_EPS);
-                memcpy(hidden, normed, HIDDEN_DIM * sizeof(float));
-                free(normed);
+                cpu_rms_norm(hidden, final_norm_w, hidden, HIDDEN_DIM, RMS_NORM_EPS);
             }
 
             // LM head
@@ -9910,6 +9902,8 @@ int main(int argc, char **argv) {
 
             // Greedy sample
             next_token = cpu_argmax(logits, VOCAB_SIZE);
+
+            } // @autoreleasepool
 
             // Think budget: force end thinking if over budget
             if (in_think && g_think_budget > 0 && think_tokens >= g_think_budget) {

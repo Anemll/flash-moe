@@ -30,12 +30,9 @@ struct ModelListView: View {
     @State private var isScanning = true
     @State private var loadError: String?
     @State private var selectedModel: LocalModel?
-    @AppStorage("cacheIOSplit") private var cacheIOSplit: Int = 1
+    @AppStorage("cacheIOSplit") private var cacheIOSplit: Int = 4
     @AppStorage("chatTemplateEnabled") private var chatTemplateEnabled: Bool = true
     @AppStorage("lastModelPath") private var lastModelPath: String = ""
-    @State private var isProfileRunning = false
-    @State private var profileResult: String?
-    @State private var showProfileResult = false
     private let downloadManager = DownloadManager.shared
 
     var body: some View {
@@ -109,30 +106,9 @@ struct ModelListView: View {
             }
 
             Section("Profile") {
-                Button {
-                    runProfile()
-                } label: {
-                    HStack {
-                        Label("Run Timing Profile", systemImage: "gauge.with.dots.needle.50percent")
-                        Spacer()
-                        if isProfileRunning {
-                            ProgressView()
-                        }
-                    }
-                }
-                .disabled(engine.state != .ready || isProfileRunning)
-
-                Text("Generates 20 tokens with timing enabled. Model must be loaded first.")
+                Text("Load a model, then use the \(Image(systemName: "ellipsis.circle")) menu in Chat to run a timing profile.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-
-                if let result = profileResult {
-                    Button {
-                        showProfileResult = true
-                    } label: {
-                        Label("View Last Profile", systemImage: "doc.text")
-                    }
-                }
             }
 
             if let error = downloadManager.error,
@@ -153,9 +129,6 @@ struct ModelListView: View {
             }
         }
         .navigationTitle("Flash-MoE")
-        .sheet(isPresented: $showProfileResult) {
-            ProfileResultSheet(result: profileResult ?? "")
-        }
         .onAppear { scanForModels() }
         .refreshable { scanForModels() }
         .onChange(of: downloadManager.activeDownload?.status) { _, newStatus in
@@ -189,18 +162,6 @@ struct ModelListView: View {
             await MainActor.run {
                 localModels = models
                 isScanning = false
-            }
-        }
-    }
-
-    private func runProfile() {
-        isProfileRunning = true
-        Task {
-            let result = await engine.runProfile(numTokens: 20)
-            await MainActor.run {
-                profileResult = result
-                isProfileRunning = false
-                showProfileResult = true
             }
         }
     }
@@ -388,6 +349,17 @@ struct ProfileResultSheet: View {
     let result: String
     @Environment(\.dismiss) private var dismiss
 
+    /// Extract model name from the report "Model:   xxx" line
+    private var modelName: String {
+        for line in result.split(separator: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("Model:") {
+                return trimmed.replacingOccurrences(of: "Model:", with: "").trimmingCharacters(in: .whitespaces)
+            }
+        }
+        return ""
+    }
+
     var body: some View {
         NavigationStack {
             ScrollView {
@@ -397,7 +369,7 @@ struct ProfileResultSheet: View {
                     .padding()
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .navigationTitle("Timing Profile")
+            .navigationTitle(modelName.isEmpty ? "Timing Profile" : "Profile: \(modelName)")
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { dismiss() }

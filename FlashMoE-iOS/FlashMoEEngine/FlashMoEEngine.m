@@ -1196,22 +1196,21 @@ static const char *get_device_name(void) {
     return m;  // fallback to raw machine ID
 }
 
-char *flashmoe_run_profile(FlashMoEContext *ctx, int num_tokens) {
-    if (!ctx || !ctx->loaded) return NULL;
-
-    // Enable timing, reset accumulators
+// Enable timing accumulation and reset counters
+void flashmoe_timing_enable(FlashMoEContext *ctx) {
+    (void)ctx;
     g_timing_enabled = 1;
     memset(&g_timing, 0, sizeof(g_timing));
+}
 
-    // Reset state for clean profile run
-    flashmoe_reset(ctx);
+// Build timing report from accumulated data. Caller must free().
+char *flashmoe_timing_report(FlashMoEContext *ctx) {
+    if (!ctx) return NULL;
 
-    // Generate with "Hi" prompt (minimal prefill)
-    int generated = flashmoe_generate(ctx, "Hi", num_tokens, NULL, NULL);
+    g_timing_enabled = 0;
 
-    // Build report string
     char *buf = malloc(8192);
-    if (!buf) { g_timing_enabled = 0; return NULL; }
+    if (!buf) return NULL;
     int pos = 0;
     int n = g_timing.count;
     int toks = g_timing.token_count;
@@ -1221,7 +1220,6 @@ char *flashmoe_run_profile(FlashMoEContext *ctx, int num_tokens) {
     const char *model_name = strrchr(model_path, '/');
     model_name = model_name ? model_name + 1 : model_path;
 
-    // Get RAM info
     uint64_t total_ram = [NSProcessInfo processInfo].physicalMemory;
     double avail_ram_mb = 0;
 #if TARGET_OS_IOS
@@ -1248,8 +1246,7 @@ char *flashmoe_run_profile(FlashMoEContext *ctx, int num_tokens) {
         g_use_2bit ? 2 : (g_use_q3_experts ? 3 : 4), ctx->K);
 
     if (n == 0 || toks == 0) {
-        pos += snprintf(buf + pos, 8192 - pos, "No timing data (generated %d tokens)\n", generated);
-        g_timing_enabled = 0;
+        pos += snprintf(buf + pos, 8192 - pos, "No timing data (%d layers timed, %d tokens)\n", n, toks);
         return buf;
     }
 
@@ -1286,6 +1283,7 @@ char *flashmoe_run_profile(FlashMoEContext *ctx, int num_tokens) {
     pos += snprintf(buf + pos, 8192 - pos,
         "LM head:            %5.1f ms  %4.1f%%\n",
         lm_ms, 100*lm_ms/total_ms);
+
     // Compute effective SSD throughput
     int expert_size = g_use_2bit ? EXPERT_SIZE_2BIT :
                       g_use_q3_experts ? EXPERT_SIZE_Q3_HYBRID : EXPERT_SIZE;
@@ -1329,11 +1327,17 @@ char *flashmoe_run_profile(FlashMoEContext *ctx, int num_tokens) {
         g_timing.expert_io / n,
         g_timing.cmd3_encode / n);
 
-    // Also log to NSLog
     NSLog(@"[profile]\n%s", buf);
-
-    g_timing_enabled = 0;
     return buf;
+}
+
+// Convenience: run a self-contained timing profile (blocking)
+char *flashmoe_run_profile(FlashMoEContext *ctx, int num_tokens) {
+    if (!ctx || !ctx->loaded) return NULL;
+    flashmoe_timing_enable(ctx);
+    flashmoe_reset(ctx);
+    flashmoe_generate(ctx, "What is Apple Neural Engine?", num_tokens, NULL, NULL);
+    return flashmoe_timing_report(ctx);
 }
 
 int flashmoe_validate_model(const char *model_path) {
