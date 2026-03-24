@@ -184,8 +184,15 @@ int flashmoe_load(FlashMoEContext *ctx, const FlashMoEConfig *config) {
                   ctx_limit, kv_per_cache / 1e6, g_cfg.num_full_attn_layers);
         }
 
-        // K = experts per token from config (capped to MAX_K)
-        ctx->K = g_cfg.num_experts_per_tok;
+        // K = experts per token (override or model default, capped to MAX_K)
+        int model_k = g_cfg.num_experts_per_tok;
+        if (config->active_k > 0 && config->active_k <= model_k) {
+            ctx->K = config->active_k;
+            NSLog(@"[FlashMoE] K override: %d (model default: %d) — %d%% I/O reduction",
+                  ctx->K, model_k, (int)((1.0 - (double)ctx->K / model_k) * 100));
+        } else {
+            ctx->K = model_k;
+        }
         if (ctx->K > MAX_K) ctx->K = MAX_K;
 
         // ---- Build file paths ----
@@ -1338,6 +1345,23 @@ char *flashmoe_run_profile(FlashMoEContext *ctx, int num_tokens) {
     flashmoe_reset(ctx);
     flashmoe_generate(ctx, "What is Apple Neural Engine?", num_tokens, NULL, NULL);
     return flashmoe_timing_report(ctx);
+}
+
+// ---- Optimization toggles ----
+
+void flashmoe_set_gpu_combine(int enabled) {
+    g_disable_gpu_combine = !enabled;
+    NSLog(@"[opt] GPU combine (fused CMD3): %s", enabled ? "ON" : "OFF");
+}
+
+void flashmoe_set_gpu_linear_attn(int enabled) {
+    gpu_linear_attn_enabled = enabled;
+    NSLog(@"[opt] GPU linear attention: %s", enabled ? "ON" : "OFF");
+}
+
+void flashmoe_set_expert_prefetch(int enabled) {
+    g_disable_expert_prefetch = !enabled;
+    NSLog(@"[opt] Expert prefetch (async pread): %s", enabled ? "ON" : "OFF");
 }
 
 int flashmoe_validate_model(const char *model_path) {

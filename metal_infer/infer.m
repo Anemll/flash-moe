@@ -81,7 +81,7 @@
 #define MAX_LAYERS          64
 #define MAX_EXPERTS         512
 #define MAX_HIDDEN_DIM      4096
-#define MAX_K               8
+#define MAX_K               16
 
 // Runtime model configuration (populated from config.json / model_weights.json)
 typedef struct {
@@ -396,7 +396,7 @@ typedef struct {
 } LZ4IndexEntry;
 
 static LZ4IndexEntry *g_lz4_index[MAX_LAYERS];  // per-layer index (NULL if not using LZ4)
-static void *g_lz4_comp_bufs[8];                 // pre-allocated compressed read buffers (MAX_K=8)
+static void *g_lz4_comp_bufs[MAX_K];             // pre-allocated compressed read buffers
 static int g_use_lz4 = 0;                        // auto-detected from packed_experts_lz4/
 
 // ============================================================================
@@ -495,6 +495,12 @@ static int g_cache_io_split = 1;  // enabled by --cache-io-split N: split each r
 static int g_think_budget = 2048; // max thinking tokens before force-emitting </think>
 static int g_stream_mode = 0;    // --stream: clean output only, no progress/stats
 static int g_nax_disabled = 1;   // NAX disabled by default (slower for M=1 decode); --nax to enable
+
+// ---- Optimization toggles (for A/B profiling) ----
+static int g_disable_gpu_combine = 0;    // disable fused CMD3 combine+residual+norm on GPU
+static int g_disable_fused_experts = 0;  // disable batched expert GPU encoding (fall back to sequential)
+static int g_disable_expert_prefetch = 0;// disable async pread prefetch (use synchronous pread)
+// gpu_linear_attn_enabled already exists (line ~4629) for fused attention toggle
 
 // Tiered I/O: cold fds (F_NOCACHE) for first reads, warm fds (page cached) for repeats
 static int *g_layer_fds_cold = NULL;    // [NUM_LAYERS] cold fds (set in main)
@@ -778,36 +784,39 @@ static void timing_print(void) {
     // Per-token decode breakdown
     if (g_timing.token_count > 0) {
         int toks = g_timing.token_count;
+        double layers_per_tok = (toks > 0) ? ((double)n / (double)toks) : 0.0;
+        double linear_layers_per_tok = (toks > 0) ? ((double)g_timing.count_linear / (double)toks) : 0.0;
+        double full_layers_per_tok = (toks > 0) ? ((double)g_timing.count_full / (double)toks) : 0.0;
         // Dense/attention (CMD1 + cpu_attn): Q/K/V projections + attention compute
-        double dense_attn_ms = (g_timing.cmd1_submit + g_timing.cmd1_wait + g_timing.cpu_attn) / n * 60;
+        double dense_attn_ms = (g_timing.cmd1_submit + g_timing.cmd1_wait + g_timing.cpu_attn) / n * layers_per_tok;
         // o_proj + norm + routing + shared expert (CMD2)
-        double oproj_shared_ms = (g_timing.cmd2_encode + g_timing.cmd2_wait + g_timing.routing_cpu) / n * 60;
+        double oproj_shared_ms = (g_timing.cmd2_encode + g_timing.cmd2_wait + g_timing.routing_cpu) / n * layers_per_tok;
         // Routed expert I/O (SSD pread K=4 experts)
-        double expert_io_ms = g_timing.expert_io / n * 60;
+        double expert_io_ms = g_timing.expert_io / n * layers_per_tok;
         // Routed expert compute (CMD3 GPU forward)
-        double expert_compute_ms = (g_timing.cmd3_encode + g_timing.deferred_wait + g_timing.deferred_cpu) / n * 60;
+        double expert_compute_ms = (g_timing.cmd3_encode + g_timing.deferred_wait + g_timing.deferred_cpu) / n * layers_per_tok;
         // LM head
         double lm_ms = g_timing.lm_head / toks;
         // Total per token
         double total_ms = dense_attn_ms + oproj_shared_ms + expert_io_ms + expert_compute_ms + lm_ms;
 
         // Linear attn vs full attn time
-        double linear_ms = (g_timing.count_linear > 0) ? g_timing.total_linear / g_timing.count_linear * 45 / toks : 0;
-        double full_ms = (g_timing.count_full > 0) ? g_timing.total_full / g_timing.count_full * 15 / toks : 0;
+        double linear_ms = (g_timing.count_linear > 0) ? g_timing.total_linear / toks : 0;
+        double full_ms = (g_timing.count_full > 0) ? g_timing.total_full / toks : 0;
 
         fprintf(stderr, "\n[decode breakdown per token]\n");
-        fprintf(stderr, "  Dense/attn (CMD1):    %6.1f ms  %4.1f%%  (Q/K/V proj + attn, 60 layers)\n",
-                dense_attn_ms, 100*dense_attn_ms/total_ms);
-        fprintf(stderr, "    GatedDeltaNet:      %6.1f ms         (45 linear layers)\n", linear_ms);
-        fprintf(stderr, "    Full attention:     %6.1f ms         (15 full layers)\n", full_ms);
+        fprintf(stderr, "  Dense/attn (CMD1):    %6.1f ms  %4.1f%%  (Q/K/V proj + attn, %.0f layers)\n",
+                dense_attn_ms, 100*dense_attn_ms/total_ms, layers_per_tok);
+        fprintf(stderr, "    GatedDeltaNet:      %6.1f ms         (%.0f linear layers)\n", linear_ms, linear_layers_per_tok);
+        fprintf(stderr, "    Full attention:     %6.1f ms         (%.0f full layers)\n", full_ms, full_layers_per_tok);
         fprintf(stderr, "  o_proj+shared (CMD2): %6.1f ms  %4.1f%%  (o_proj, norm, routing, shared expert)\n",
                 oproj_shared_ms, 100*oproj_shared_ms/total_ms);
-        fprintf(stderr, "  Expert I/O (SSD):     %6.1f ms  %4.1f%%  (pread K=4 experts × 60 layers)\n",
-                expert_io_ms, 100*expert_io_ms/total_ms);
-        fprintf(stderr, "  Expert compute (CMD3):%6.1f ms  %4.1f%%  (GPU forward K=4 × 60 layers)\n",
-                expert_compute_ms, 100*expert_compute_ms/total_ms);
-        fprintf(stderr, "  LM head:              %6.1f ms  %4.1f%%  (248K × 4096 matvec)\n",
-                lm_ms, 100*lm_ms/total_ms);
+        fprintf(stderr, "  Expert I/O (SSD):     %6.1f ms  %4.1f%%  (pread K=%d experts × %.0f layers)\n",
+                expert_io_ms, 100*expert_io_ms/total_ms, NUM_EXPERTS_PER_TOK, layers_per_tok);
+        fprintf(stderr, "  Expert compute (CMD3):%6.1f ms  %4.1f%%  (GPU forward K=%d × %.0f layers)\n",
+                expert_compute_ms, 100*expert_compute_ms/total_ms, NUM_EXPERTS_PER_TOK, layers_per_tok);
+        fprintf(stderr, "  LM head:              %6.1f ms  %4.1f%%  (%d × %d matvec)\n",
+                lm_ms, 100*lm_ms/total_ms, VOCAB_SIZE, HIDDEN_DIM);
         fprintf(stderr, "  ─────────────────────────────────\n");
         fprintf(stderr, "  Total per token:      %6.1f ms  (%.1f tok/s)\n",
                 total_ms, 1000.0/total_ms);
@@ -7737,6 +7746,14 @@ static void fused_layer_forward(
             for (int k = 0; k < actual_K; k++) {
                 valid[k] = (tasks[k].result == (ssize_t)esz);
             }
+        } else if (g_disable_expert_prefetch) {
+            // ---- DISABLED PREFETCH: synchronous sequential pread ----
+            size_t esz = active_expert_size();
+            for (int k = 0; k < actual_K; k++) {
+                void *dst = [g_metal->buf_multi_expert_data[k] contents];
+                pread(packed_fd, dst, esz, (off_t)expert_indices[k] * esz);
+                expert_bufs[k] = g_metal->buf_multi_expert_data[k];
+            }
         } else {
             // ---- No cache, no prediction, no LZ4: ASYNC parallel pread ----
             async_pread_start(packed_fd, expert_indices, actual_K,
@@ -7836,7 +7853,8 @@ static void fused_layer_forward(
         // This makes CMD3 self-contained: it produces buf_input for the next layer's CMD1.
         // The next layer skips deferred_wait + finalize + input_norm entirely at layer start.
 
-        int gpu_combine = (!shared_override_active &&
+        int gpu_combine = (!g_disable_gpu_combine &&
+                           !shared_override_active &&
                            g_metal->moe_combine_residual &&
                            g_metal->rms_norm_sum &&
                            g_metal->rms_norm_apply_bf16 &&
@@ -9226,7 +9244,7 @@ int main(int argc, char **argv) {
         }
 
         if (!g_stream_mode) {
-            printf("=== Qwen3.5-397B-A17B Metal Inference Engine ===\n");
+            printf("=== Qwen3.5 MoE Metal Inference Engine ===\n");
             printf("Model:    %s\n", model_path);
             printf("Weights:  %s\n", weights_path);
             printf("Manifest: %s\n", manifest_path);

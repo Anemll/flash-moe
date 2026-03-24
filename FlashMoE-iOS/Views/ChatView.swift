@@ -29,6 +29,7 @@ struct ChatView: View {
     @State private var isGenerating = false
     @State private var showStats = false
     @AppStorage("chatTemplateEnabled") private var chatTemplateEnabled: Bool = true
+    @AppStorage("maxGenerationTokens") private var maxGenerationTokens: Int = 2048
     @State private var showModelInfo = false
     @State private var showProfiler = false
     @State private var isProfileRunning = false
@@ -209,11 +210,11 @@ struct ChatView: View {
 
             if engine.canContinue {
                 // Reuse KV cache — only process the new user turn
-                stream = engine.generateContinuation(userMessage: text, maxTokens: 500)
+                stream = engine.generateContinuation(userMessage: text, maxTokens: maxGenerationTokens)
             } else {
                 // First message — full chat template with system prompt
                 let formattedPrompt = buildChatPrompt(userMessage: text)
-                stream = engine.generate(prompt: formattedPrompt, maxTokens: 500)
+                stream = engine.generate(prompt: formattedPrompt, maxTokens: maxGenerationTokens)
             }
 
             var gotTokens = false
@@ -235,7 +236,7 @@ struct ChatView: View {
             if !gotTokens && engine.canContinue {
                 engine.reset()
                 let formattedPrompt = buildChatPrompt(userMessage: text)
-                let fallbackStream = engine.generate(prompt: formattedPrompt, maxTokens: 500)
+                let fallbackStream = engine.generate(prompt: formattedPrompt, maxTokens: maxGenerationTokens)
                 for await token in fallbackStream {
                     if token.tokensGenerated < 0 { continue }
                     let clean = token.text

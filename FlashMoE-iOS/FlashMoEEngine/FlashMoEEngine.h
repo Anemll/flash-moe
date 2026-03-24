@@ -38,6 +38,7 @@ typedef struct {
     int use_tiered;             // 1 = use tiered quantization if available, 0 = auto-detect
     int use_2bit;               // 1 = use 2-bit experts (packed_experts_2bit/)
     int cache_io_split;         // >1 = split each expert pread into N page-aligned chunks (fanout), 0/1 = disabled
+    int active_k;               // Override active experts per token (0 = use model default, capped to MAX_K)
     int verbose;                // 1 = log to stderr, 0 = quiet
 } FlashMoEConfig;
 
@@ -136,6 +137,11 @@ void flashmoe_timing_enable(FlashMoEContext *ctx);
 
 // Build timing report string (call after generate). Caller must free().
 char *flashmoe_timing_report(FlashMoEContext *ctx);
+
+// ---- Optimization toggles (for A/B profiling) ----
+void flashmoe_set_gpu_combine(int enabled);     // fused CMD3 combine+residual+norm
+void flashmoe_set_gpu_linear_attn(int enabled);  // fused GPU attention (delta-net)
+void flashmoe_set_expert_prefetch(int enabled);   // async parallel pread
 
 // ---- Utility ----
 

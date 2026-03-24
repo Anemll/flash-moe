@@ -119,7 +119,8 @@ final class FlashMoEEngine: @unchecked Sendable {
     /// Load a model from the given path. Runs on a background thread.
     func loadModel(at path: String, maxContext: Int = 0, thinkBudget: Int = 2048,
                    useTiered: Bool = false, use2bit: Bool = false,
-                   cacheIOSplit: Int = 1, verbose: Bool = false) async throws {
+                   cacheIOSplit: Int = 1, activeK: Int = 0,
+                   verbose: Bool = false) async throws {
         guard state != .loading && state != .generating else {
             throw FlashMoEError.busy
         }
@@ -152,6 +153,7 @@ final class FlashMoEEngine: @unchecked Sendable {
                 config.use_tiered = useTiered ? 1 : 0
                 config.use_2bit = use2bit ? 1 : 0
                 config.cache_io_split = Int32(cacheIOSplit)
+                config.active_k = Int32(activeK)
                 config.verbose = verbose ? 1 : 0
 
                 // Load
@@ -248,6 +250,12 @@ final class FlashMoEEngine: @unchecked Sendable {
         free(ptr)
         return result
     }
+
+    // MARK: - Optimization Toggles
+
+    func setGPUCombine(_ enabled: Bool) { flashmoe_set_gpu_combine(enabled ? 1 : 0) }
+    func setGPULinearAttn(_ enabled: Bool) { flashmoe_set_gpu_linear_attn(enabled ? 1 : 0) }
+    func setExpertPrefetch(_ enabled: Bool) { flashmoe_set_expert_prefetch(enabled ? 1 : 0) }
 
     // MARK: - Generation
 

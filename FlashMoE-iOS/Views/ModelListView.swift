@@ -33,6 +33,11 @@ struct ModelListView: View {
     @AppStorage("cacheIOSplit") private var cacheIOSplit: Int = 4
     @AppStorage("chatTemplateEnabled") private var chatTemplateEnabled: Bool = true
     @AppStorage("lastModelPath") private var lastModelPath: String = ""
+    @AppStorage("maxGenerationTokens") private var maxGenerationTokens: Int = 2048
+    @AppStorage("activeExpertsK") private var activeExpertsK: Int = 4
+    @AppStorage("gpuCombineEnabled") private var gpuCombineEnabled: Bool = true
+    @AppStorage("gpuLinearAttnEnabled") private var gpuLinearAttnEnabled: Bool = true
+    @AppStorage("expertPrefetchEnabled") private var expertPrefetchEnabled: Bool = true
     private let downloadManager = DownloadManager.shared
 
     var body: some View {
@@ -84,6 +89,19 @@ struct ModelListView: View {
             }
 
             Section("I/O Settings") {
+                Picker("Active Experts (K)", selection: $activeExpertsK) {
+                    Text("Model default").tag(0)
+                    Text("K=2 (fastest)").tag(2)
+                    Text("K=4 (recommended)").tag(4)
+                    Text("K=6 (high quality)").tag(6)
+                    Text("K=8").tag(8)
+                    Text("K=10").tag(10)
+                }
+                .pickerStyle(.menu)
+                Text("Experts loaded per token. K=4 is the original default — best speed/quality. K=6 matches K=10 quality. Reload model to apply.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
                 Picker("Expert I/O Fanout", selection: $cacheIOSplit) {
                     Text("Off (single pread)").tag(1)
                     Text("2 chunks").tag(2)
@@ -101,6 +119,32 @@ struct ModelListView: View {
             Section("Chat Settings") {
                 Toggle("Chat Template", isOn: $chatTemplateEnabled)
                 Text("Wraps prompts in Qwen chat format (<|im_start|>). Disable for smoke test models or raw text mode.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Generation") {
+                Picker("Max Tokens", selection: $maxGenerationTokens) {
+                    Text("256").tag(256)
+                    Text("512").tag(512)
+                    Text("1024").tag(1024)
+                    Text("2048").tag(2048)
+                    Text("4096").tag(4096)
+                }
+                .pickerStyle(.menu)
+                Text("Maximum tokens per response. Higher values allow longer replies but take more time.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("GPU Optimizations") {
+                Toggle("Fused CMD3 (combine+norm)", isOn: $gpuCombineEnabled)
+                    .onChange(of: gpuCombineEnabled) { _, val in engine.setGPUCombine(val) }
+                Toggle("GPU Linear Attention", isOn: $gpuLinearAttnEnabled)
+                    .onChange(of: gpuLinearAttnEnabled) { _, val in engine.setGPULinearAttn(val) }
+                Toggle("Expert Prefetch (async pread)", isOn: $expertPrefetchEnabled)
+                    .onChange(of: expertPrefetchEnabled) { _, val in engine.setExpertPrefetch(val) }
+                Text("Disable to measure per-optimization impact via timing profile.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -179,8 +223,13 @@ struct ModelListView: View {
                     useTiered: model.hasTiered,
                     use2bit: model.has2bit && !model.hasTiered && !model.has4bit,
                     cacheIOSplit: cacheIOSplit,
+                    activeK: activeExpertsK,
                     verbose: true
                 )
+                // Apply optimization toggles
+                engine.setGPUCombine(gpuCombineEnabled)
+                engine.setGPULinearAttn(gpuLinearAttnEnabled)
+                engine.setExpertPrefetch(expertPrefetchEnabled)
             } catch {
                 // Error state is set by the engine
             }
