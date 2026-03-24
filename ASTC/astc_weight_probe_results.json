@@ -1,0 +1,1161 @@
+{
+  "base_model": {
+    "train_acc": 0.9916492693110647,
+    "test_acc": 0.9722222222222222,
+    "layer_shapes": [
+      [
+        64,
+        128
+      ],
+      [
+        128,
+        128
+      ],
+      [
+        128,
+        10
+      ]
+    ],
+    "total_weights": 25856
+  },
+  "per_layer_6x6_minshift": [
+    {
+      "layer": 0,
+      "shape": [
+        64,
+        128
+      ],
+      "mae": 0.032640255987644196,
+      "rmse": 0.044526711106300354,
+      "max_abs": 0.22540336847305298,
+      "rel_l2": 0.40380188822746277,
+      "cosine": 0.9171996116638184,
+      "ph": 66,
+      "pw": 132,
+      "blocks": 242,
+      "astc_bytes": 3872,
+      "min_bytes": 484,
+      "total_bytes": 4356,
+      "astc_bpw_nominal": 3.5555555555555554,
+      "effective_bpw_on_original": 4.25390625,
+      "test_acc": 0.9611111111111111,
+      "acc_drop_pp": 1.1111111111111072,
+      "logit_rmse": 0.7625094652175903,
+      "logit_mae": 0.5076071619987488
+    },
+    {
+      "layer": 1,
+      "shape": [
+        128,
+        128
+      ],
+      "mae": 0.027374429628252983,
+      "rmse": 0.03748956322669983,
+      "max_abs": 0.2754625976085663,
+      "rel_l2": 0.39496910572052,
+      "cosine": 0.9208410382270813,
+      "ph": 132,
+      "pw": 132,
+      "blocks": 484,
+      "astc_bytes": 7744,
+      "min_bytes": 968,
+      "total_bytes": 8712,
+      "astc_bpw_nominal": 3.5555555555555554,
+      "effective_bpw_on_original": 4.25390625,
+      "test_acc": 0.95,
+      "acc_drop_pp": 2.2222222222222254,
+      "logit_rmse": 0.7069441676139832,
+      "logit_mae": 0.5333659648895264
+    },
+    {
+      "layer": 2,
+      "shape": [
+        128,
+        10
+      ],
+      "mae": 0.0409805066883564,
+      "rmse": 0.057016462087631226,
+      "max_abs": 0.2227933257818222,
+      "rel_l2": 0.4046694040298462,
+      "cosine": 0.9201200008392334,
+      "ph": 132,
+      "pw": 12,
+      "blocks": 44,
+      "astc_bytes": 704,
+      "min_bytes": 88,
+      "total_bytes": 792,
+      "astc_bpw_nominal": 3.5555555555555554,
+      "effective_bpw_on_original": 4.95,
+      "test_acc": 0.9611111111111111,
+      "acc_drop_pp": 1.1111111111111072,
+      "logit_rmse": 0.9484208822250366,
+      "logit_mae": 0.6898194551467896
+    }
+  ],
+  "whole_model": [
+    {
+      "scheme": "fp16",
+      "layer_infos": [
+        {
+          "shape": [
+            64,
+            128
+          ],
+          "mae": 1.6425552530563436e-05,
+          "rmse": 2.2640606403001584e-05,
+          "max_abs": 7.843971252441406e-05,
+          "rel_l2": 0.00020532213966362178,
+          "cosine": 1.000000238418579,
+          "h": 64,
+          "w": 128,
+          "total_bytes": 16384,
+          "effective_bpw_on_original": 16.0
+        },
+        {
+          "shape": [
+            128,
+            128
+          ],
+          "mae": 1.4378189007402398e-05,
+          "rmse": 2.0065417629666626e-05,
+          "max_abs": 6.102025508880615e-05,
+          "rel_l2": 0.0002113980590365827,
+          "cosine": 1.0,
+          "h": 128,
+          "w": 128,
+          "total_bytes": 32768,
+          "effective_bpw_on_original": 16.0
+        },
+        {
+          "shape": [
+            128,
+            10
+          ],
+          "mae": 2.0711881006718613e-05,
+          "rmse": 2.7709451387636364e-05,
+          "max_abs": 0.00011911988258361816,
+          "rel_l2": 0.00019666545267682523,
+          "cosine": 1.0,
+          "h": 128,
+          "w": 10,
+          "total_bytes": 2560,
+          "effective_bpw_on_original": 16.0
+        }
+      ],
+      "total_bytes": 51712,
+      "total_effective_bpw": 16.0,
+      "test_acc": 0.9722222222222222,
+      "acc_drop_pp": 0.0,
+      "logit_rmse": 0.0005363877862691879,
+      "logit_mae": 0.00038195171509869397,
+      "secs": 0.008341073989868164
+    },
+    {
+      "scheme": "int4_6x6",
+      "layer_infos": [
+        {
+          "shape": [
+            64,
+            128
+          ],
+          "mae": 0.006240142975002527,
+          "rmse": 0.00742232846096158,
+          "max_abs": 0.015244469046592712,
+          "rel_l2": 0.06731128692626953,
+          "cosine": 0.997745931148529,
+          "h": 64,
+          "w": 128,
+          "ph": 66,
+          "pw": 132,
+          "blocks": 242,
+          "total_bytes": 5324,
+          "effective_bpw_on_original": 5.19921875
+        },
+        {
+          "shape": [
+            128,
+            128
+          ],
+          "mae": 0.005232301075011492,
+          "rmse": 0.006273086182773113,
+          "max_abs": 0.013822760432958603,
+          "rel_l2": 0.06608973443508148,
+          "cosine": 0.9978243708610535,
+          "h": 128,
+          "w": 128,
+          "ph": 132,
+          "pw": 132,
+          "blocks": 484,
+          "total_bytes": 10648,
+          "effective_bpw_on_original": 5.19921875
+        },
+        {
+          "shape": [
+            128,
+            10
+          ],
+          "mae": 0.0074629755690693855,
+          "rmse": 0.00891989003866911,
+          "max_abs": 0.017745234072208405,
+          "rel_l2": 0.06330815702676773,
+          "cosine": 0.9980233311653137,
+          "h": 128,
+          "w": 10,
+          "ph": 132,
+          "pw": 12,
+          "blocks": 44,
+          "total_bytes": 968,
+          "effective_bpw_on_original": 6.05
+        }
+      ],
+      "total_bytes": 16940,
+      "total_effective_bpw": 5.241336633663367,
+      "test_acc": 0.9694444444444444,
+      "acc_drop_pp": 0.2777777777777768,
+      "logit_rmse": 0.16326430439949036,
+      "logit_mae": 0.11558829247951508,
+      "secs": 0.14729928970336914
+    },
+    {
+      "scheme": "astc_4x4_minshift",
+      "layer_infos": [
+        {
+          "shape": [
+            64,
+            128
+          ],
+          "mae": 0.004720387049019337,
+          "rmse": 0.006746681872755289,
+          "max_abs": 0.04946386069059372,
+          "rel_l2": 0.06118401139974594,
+          "cosine": 0.9981300830841064,
+          "h": 64,
+          "w": 128,
+          "ph": 64,
+          "pw": 128,
+          "blocks": 512,
+          "astc_bytes": 8192,
+          "min_bytes": 1024,
+          "total_bytes": 9216,
+          "astc_bpw_nominal": 8.0,
+          "effective_bpw_on_original": 9.0
+        },
+        {
+          "shape": [
+            128,
+            128
+          ],
+          "mae": 0.0040935976430773735,
+          "rmse": 0.005928071215748787,
+          "max_abs": 0.04819148778915405,
+          "rel_l2": 0.06245484575629234,
+          "cosine": 0.9980524778366089,
+          "h": 128,
+          "w": 128,
+          "ph": 128,
+          "pw": 128,
+          "blocks": 1024,
+          "astc_bytes": 16384,
+          "min_bytes": 2048,
+          "total_bytes": 18432,
+          "astc_bpw_nominal": 8.0,
+          "effective_bpw_on_original": 9.0
+        },
+        {
+          "shape": [
+            128,
+            10
+          ],
+          "mae": 0.005662720650434494,
+          "rmse": 0.008340724743902683,
+          "max_abs": 0.03873801231384277,
+          "rel_l2": 0.05919758230447769,
+          "cosine": 0.9982462525367737,
+          "h": 128,
+          "w": 10,
+          "ph": 128,
+          "pw": 12,
+          "blocks": 96,
+          "astc_bytes": 1536,
+          "min_bytes": 192,
+          "total_bytes": 1728,
+          "astc_bpw_nominal": 8.0,
+          "effective_bpw_on_original": 10.8
+        }
+      ],
+      "total_bytes": 29376,
+      "total_effective_bpw": 9.089108910891088,
+      "test_acc": 0.9805555555555555,
+      "acc_drop_pp": -0.8333333333333304,
+      "logit_rmse": 0.17502614855766296,
+      "logit_mae": 0.12392149120569229,
+      "secs": 0.37827038764953613
+    },
+    {
+      "scheme": "astc_6x6_minshift",
+      "layer_infos": [
+        {
+          "shape": [
+            64,
+            128
+          ],
+          "mae": 0.032640255987644196,
+          "rmse": 0.044526711106300354,
+          "max_abs": 0.22540336847305298,
+          "rel_l2": 0.40380188822746277,
+          "cosine": 0.9171996116638184,
+          "h": 64,
+          "w": 128,
+          "ph": 66,
+          "pw": 132,
+          "blocks": 242,
+          "astc_bytes": 3872,
+          "min_bytes": 484,
+          "total_bytes": 4356,
+          "astc_bpw_nominal": 3.5555555555555554,
+          "effective_bpw_on_original": 4.25390625
+        },
+        {
+          "shape": [
+            128,
+            128
+          ],
+          "mae": 0.027374429628252983,
+          "rmse": 0.03748956322669983,
+          "max_abs": 0.2754625976085663,
+          "rel_l2": 0.39496910572052,
+          "cosine": 0.9208410382270813,
+          "h": 128,
+          "w": 128,
+          "ph": 132,
+          "pw": 132,
+          "blocks": 484,
+          "astc_bytes": 7744,
+          "min_bytes": 968,
+          "total_bytes": 8712,
+          "astc_bpw_nominal": 3.5555555555555554,
+          "effective_bpw_on_original": 4.25390625
+        },
+        {
+          "shape": [
+            128,
+            10
+          ],
+          "mae": 0.0409805066883564,
+          "rmse": 0.057016462087631226,
+          "max_abs": 0.2227933257818222,
+          "rel_l2": 0.4046694040298462,
+          "cosine": 0.9201200008392334,
+          "h": 128,
+          "w": 10,
+          "ph": 132,
+          "pw": 12,
+          "blocks": 44,
+          "astc_bytes": 704,
+          "min_bytes": 88,
+          "total_bytes": 792,
+          "astc_bpw_nominal": 3.5555555555555554,
+          "effective_bpw_on_original": 4.95
+        }
+      ],
+      "total_bytes": 13860,
+      "total_effective_bpw": 4.288366336633663,
+      "test_acc": 0.9444444444444444,
+      "acc_drop_pp": 2.777777777777779,
+      "logit_rmse": 1.4532431364059448,
+      "logit_mae": 1.1138968467712402,
+      "secs": 0.4907267093658447
+    },
+    {
+      "scheme": "astc_8x8_minshift",
+      "layer_infos": [
+        {
+          "shape": [
+            64,
+            128
+          ],
+          "mae": 0.055769890546798706,
+          "rmse": 0.07138580828905106,
+          "max_abs": 0.32778385281562805,
+          "rel_l2": 0.6473804712295532,
+          "cosine": 0.764923095703125,
+          "h": 64,
+          "w": 128,
+          "ph": 64,
+          "pw": 128,
+          "blocks": 128,
+          "astc_bytes": 2048,
+          "min_bytes": 256,
+          "total_bytes": 2304,
+          "astc_bpw_nominal": 2.0,
+          "effective_bpw_on_original": 2.25
+        },
+        {
+          "shape": [
+            128,
+            128
+          ],
+          "mae": 0.04745393991470337,
+          "rmse": 0.06062988191843033,
+          "max_abs": 0.28311988711357117,
+          "rel_l2": 0.6387625932693481,
+          "cosine": 0.770440936088562,
+          "h": 128,
+          "w": 128,
+          "ph": 128,
+          "pw": 128,
+          "blocks": 256,
+          "astc_bytes": 4096,
+          "min_bytes": 512,
+          "total_bytes": 4608,
+          "astc_bpw_nominal": 2.0,
+          "effective_bpw_on_original": 2.25
+        },
+        {
+          "shape": [
+            128,
+            10
+          ],
+          "mae": 0.06926096975803375,
+          "rmse": 0.08944890648126602,
+          "max_abs": 0.29913461208343506,
+          "rel_l2": 0.6348558664321899,
+          "cosine": 0.7734805941581726,
+          "h": 128,
+          "w": 10,
+          "ph": 128,
+          "pw": 16,
+          "blocks": 32,
+          "astc_bytes": 512,
+          "min_bytes": 64,
+          "total_bytes": 576,
+          "astc_bpw_nominal": 2.0,
+          "effective_bpw_on_original": 3.6
+        }
+      ],
+      "total_bytes": 7488,
+      "total_effective_bpw": 2.3168316831683167,
+      "test_acc": 0.7305555555555555,
+      "acc_drop_pp": 24.16666666666667,
+      "logit_rmse": 3.0274064540863037,
+      "logit_mae": 2.208627700805664,
+      "secs": 0.5555009841918945
+    },
+    {
+      "scheme": "astc_6x6_raw",
+      "layer_infos": [
+        {
+          "shape": [
+            64,
+            128
+          ],
+          "mae": 0.06150902807712555,
+          "rmse": 0.08436982333660126,
+          "max_abs": 0.2540719509124756,
+          "rel_l2": 0.7651293873786926,
+          "cosine": 0.6447973847389221,
+          "h": 64,
+          "w": 128,
+          "ph": 66,
+          "pw": 132,
+          "blocks": 242,
+          "astc_bytes": 3872,
+          "min_bytes": 0,
+          "total_bytes": 3872,
+          "astc_bpw_nominal": 3.5555555555555554,
+          "effective_bpw_on_original": 3.78125
+        },
+        {
+          "shape": [
+            128,
+            128
+          ],
+          "mae": 0.04693209379911423,
+          "rmse": 0.06416439265012741,
+          "max_abs": 0.22178924083709717,
+          "rel_l2": 0.6760002374649048,
+          "cosine": 0.7379208207130432,
+          "h": 128,
+          "w": 128,
+          "ph": 132,
+          "pw": 132,
+          "blocks": 484,
+          "astc_bytes": 7744,
+          "min_bytes": 0,
+          "total_bytes": 7744,
+          "astc_bpw_nominal": 3.5555555555555554,
+          "effective_bpw_on_original": 3.78125
+        },
+        {
+          "shape": [
+            128,
+            10
+          ],
+          "mae": 0.08104349672794342,
+          "rmse": 0.10930410027503967,
+          "max_abs": 0.29053887724876404,
+          "rel_l2": 0.7757764458656311,
+          "cosine": 0.6327910423278809,
+          "h": 128,
+          "w": 10,
+          "ph": 132,
+          "pw": 12,
+          "blocks": 44,
+          "astc_bytes": 704,
+          "min_bytes": 0,
+          "total_bytes": 704,
+          "astc_bpw_nominal": 3.5555555555555554,
+          "effective_bpw_on_original": 4.4
+        }
+      ],
+      "total_bytes": 12320,
+      "total_effective_bpw": 3.8118811881188117,
+      "test_acc": 0.4,
+      "acc_drop_pp": 57.22222222222222,
+      "logit_rmse": 20.169206619262695,
+      "logit_mae": 12.776570320129395,
+      "secs": 0.3996138572692871
+    }
+  ],
+  "robustness": [
+    {
+      "hidden": [
+        256
+      ],
+      "seed": 7,
+      "base_acc": 0.9555555555555556,
+      "astc6_acc": 0.9388888888888889,
+      "drop_pp": 1.6666666666666718,
+      "logit_rmse": 0.7872734665870667,
+      "secs": 3.3938217163085938
+    },
+    {
+      "hidden": [
+        128,
+        128
+      ],
+      "seed": 7,
+      "base_acc": 0.975,
+      "astc6_acc": 0.9111111111111111,
+      "drop_pp": 6.388888888888888,
+      "logit_rmse": 1.4825416803359985,
+      "secs": 4.266444206237793
+    },
+    {
+      "hidden": [
+        128,
+        128
+      ],
+      "seed": 123,
+      "base_acc": 0.9444444444444444,
+      "astc6_acc": 0.9333333333333333,
+      "drop_pp": 1.1111111111111072,
+      "logit_rmse": 1.085409164428711,
+      "secs": 3.1092984676361084
+    }
+  ],
+  "svd_astc": [
+    {
+      "rank": 1,
+      "layer_infos": [
+        {
+          "shape": [
+            64,
+            128
+          ],
+          "mae": 0.030979802832007408,
+          "rmse": 0.04276576638221741,
+          "max_abs": 0.30552738904953003,
+          "rel_l2": 0.38783231377601624,
+          "cosine": 0.9242397546768188,
+          "rank": 1,
+          "low_rank_bytes": 384,
+          "astc_total_bytes": 4356,
+          "total_bytes": 4740,
+          "effective_bpw_on_original": 4.62890625
+        },
+        {
+          "shape": [
+            128,
+            128
+          ],
+          "mae": 0.026785332709550858,
+          "rmse": 0.036321625113487244,
+          "max_abs": 0.31485235691070557,
+          "rel_l2": 0.38266438245773315,
+          "cosine": 0.9259292483329773,
+          "rank": 1,
+          "low_rank_bytes": 512,
+          "astc_total_bytes": 8712,
+          "total_bytes": 9224,
+          "effective_bpw_on_original": 4.50390625
+        },
+        {
+          "shape": [
+            128,
+            10
+          ],
+          "mae": 0.03738076612353325,
+          "rmse": 0.05237531661987305,
+          "max_abs": 0.22900883853435516,
+          "rel_l2": 0.3717292845249176,
+          "cosine": 0.929663360118866,
+          "rank": 1,
+          "low_rank_bytes": 276,
+          "astc_total_bytes": 792,
+          "total_bytes": 1068,
+          "effective_bpw_on_original": 6.675
+        }
+      ],
+      "total_bytes": 15032,
+      "total_effective_bpw": 4.650990099009901,
+      "test_acc": 0.9638888888888889,
+      "acc_drop_pp": 0.8333333333333304,
+      "logit_rmse": 1.3058346509933472,
+      "logit_mae": 0.9257109761238098,
+      "secs": 4.6676788330078125
+    },
+    {
+      "rank": 2,
+      "layer_infos": [
+        {
+          "shape": [
+            64,
+            128
+          ],
+          "mae": 0.030665814876556396,
+          "rmse": 0.04193437099456787,
+          "max_abs": 0.2504098415374756,
+          "rel_l2": 0.3802925944328308,
+          "cosine": 0.9271276593208313,
+          "rank": 2,
+          "low_rank_bytes": 768,
+          "astc_total_bytes": 4356,
+          "total_bytes": 5124,
+          "effective_bpw_on_original": 5.00390625
+        },
+        {
+          "shape": [
+            128,
+            128
+          ],
+          "mae": 0.026283234357833862,
+          "rmse": 0.035835664719343185,
+          "max_abs": 0.29085594415664673,
+          "rel_l2": 0.3775445818901062,
+          "cosine": 0.9282476305961609,
+          "rank": 2,
+          "low_rank_bytes": 1024,
+          "astc_total_bytes": 8712,
+          "total_bytes": 9736,
+          "effective_bpw_on_original": 4.75390625
+        },
+        {
+          "shape": [
+            128,
+            10
+          ],
+          "mae": 0.03341595456004143,
+          "rmse": 0.04755927622318268,
+          "max_abs": 0.2873553931713104,
+          "rel_l2": 0.33754783868789673,
+          "cosine": 0.9421570897102356,
+          "rank": 2,
+          "low_rank_bytes": 552,
+          "astc_total_bytes": 792,
+          "total_bytes": 1344,
+          "effective_bpw_on_original": 8.4
+        }
+      ],
+      "total_bytes": 16204,
+      "total_effective_bpw": 5.013613861386139,
+      "test_acc": 0.95,
+      "acc_drop_pp": 2.2222222222222254,
+      "logit_rmse": 1.1248325109481812,
+      "logit_mae": 0.7874343395233154,
+      "secs": 4.2184765338897705
+    },
+    {
+      "rank": 4,
+      "layer_infos": [
+        {
+          "shape": [
+            64,
+            128
+          ],
+          "mae": 0.029321003705263138,
+          "rmse": 0.0401371568441391,
+          "max_abs": 0.21058115363121033,
+          "rel_l2": 0.3639940619468689,
+          "cosine": 0.9332900643348694,
+          "rank": 4,
+          "low_rank_bytes": 1536,
+          "astc_total_bytes": 4356,
+          "total_bytes": 5892,
+          "effective_bpw_on_original": 5.75390625
+        },
+        {
+          "shape": [
+            128,
+            128
+          ],
+          "mae": 0.025630062445998192,
+          "rmse": 0.034960418939590454,
+          "max_abs": 0.20572231709957123,
+          "rel_l2": 0.3683234751224518,
+          "cosine": 0.9319303631782532,
+          "rank": 4,
+          "low_rank_bytes": 2048,
+          "astc_total_bytes": 8712,
+          "total_bytes": 10760,
+          "effective_bpw_on_original": 5.25390625
+        },
+        {
+          "shape": [
+            128,
+            10
+          ],
+          "mae": 0.02920735441148281,
+          "rmse": 0.03977430611848831,
+          "max_abs": 0.1723097413778305,
+          "rel_l2": 0.28229472041130066,
+          "cosine": 0.9602243304252625,
+          "rank": 4,
+          "low_rank_bytes": 1104,
+          "astc_total_bytes": 792,
+          "total_bytes": 1896,
+          "effective_bpw_on_original": 11.85
+        }
+      ],
+      "total_bytes": 18548,
+      "total_effective_bpw": 5.7388613861386135,
+      "test_acc": 0.9361111111111111,
+      "acc_drop_pp": 3.6111111111111094,
+      "logit_rmse": 1.0489245653152466,
+      "logit_mae": 0.7957555055618286,
+      "secs": 4.0927135944366455
+    },
+    {
+      "rank": 8,
+      "layer_infos": [
+        {
+          "shape": [
+            64,
+            128
+          ],
+          "mae": 0.0269523523747921,
+          "rmse": 0.036869607865810394,
+          "max_abs": 0.21606707572937012,
+          "rel_l2": 0.3343614935874939,
+          "cosine": 0.9441243410110474,
+          "rank": 8,
+          "low_rank_bytes": 3072,
+          "astc_total_bytes": 4356,
+          "total_bytes": 7428,
+          "effective_bpw_on_original": 7.25390625
+        },
+        {
+          "shape": [
+            128,
+            128
+          ],
+          "mae": 0.023769361898303032,
+          "rmse": 0.032547108829021454,
+          "max_abs": 0.22003750503063202,
+          "rel_l2": 0.3428981900215149,
+          "cosine": 0.9408529996871948,
+          "rank": 8,
+          "low_rank_bytes": 4096,
+          "astc_total_bytes": 8712,
+          "total_bytes": 12808,
+          "effective_bpw_on_original": 6.25390625
+        },
+        {
+          "shape": [
+            128,
+            10
+          ],
+          "mae": 0.013367551378905773,
+          "rmse": 0.02000010758638382,
+          "max_abs": 0.11321728676557541,
+          "rel_l2": 0.14194902777671814,
+          "cosine": 0.9900280833244324,
+          "rank": 8,
+          "low_rank_bytes": 2208,
+          "astc_total_bytes": 792,
+          "total_bytes": 3000,
+          "effective_bpw_on_original": 18.75
+        }
+      ],
+      "total_bytes": 23236,
+      "total_effective_bpw": 7.189356435643564,
+      "test_acc": 0.9638888888888889,
+      "acc_drop_pp": 0.8333333333333304,
+      "logit_rmse": 0.7219510078430176,
+      "logit_mae": 0.5050826072692871,
+      "secs": 4.103682518005371
+    },
+    {
+      "rank": 16,
+      "layer_infos": [
+        {
+          "shape": [
+            64,
+            128
+          ],
+          "mae": 0.022295799106359482,
+          "rmse": 0.03047124110162258,
+          "max_abs": 0.18861158192157745,
+          "rel_l2": 0.2763362228870392,
+          "cosine": 0.9615511894226074,
+          "rank": 16,
+          "low_rank_bytes": 6144,
+          "astc_total_bytes": 4356,
+          "total_bytes": 10500,
+          "effective_bpw_on_original": 10.25390625
+        },
+        {
+          "shape": [
+            128,
+            128
+          ],
+          "mae": 0.021316515281796455,
+          "rmse": 0.029208436608314514,
+          "max_abs": 0.19800469279289246,
+          "rel_l2": 0.3077237606048584,
+          "cosine": 0.9526486396789551,
+          "rank": 16,
+          "low_rank_bytes": 8192,
+          "astc_total_bytes": 8712,
+          "total_bytes": 16904,
+          "effective_bpw_on_original": 8.25390625
+        },
+        {
+          "shape": [
+            128,
+            10
+          ],
+          "mae": 9.971495629201854e-09,
+          "rmse": 1.7077070424420526e-08,
+          "max_abs": 8.940696716308594e-08,
+          "rel_l2": 1.2120304404561466e-07,
+          "cosine": 1.0,
+          "rank": 10,
+          "low_rank_bytes": 2760,
+          "astc_total_bytes": 792,
+          "total_bytes": 3552,
+          "effective_bpw_on_original": 22.2
+        }
+      ],
+      "total_bytes": 30956,
+      "total_effective_bpw": 9.577970297029703,
+      "test_acc": 0.9722222222222222,
+      "acc_drop_pp": 0.0,
+      "logit_rmse": 0.5419354438781738,
+      "logit_mae": 0.3827781081199646,
+      "secs": 4.287735223770142
+    }
+  ],
+  "hybrid_layer1_svd_astc": [
+    {
+      "rank_on_layer1": 1,
+      "layer_infos": [
+        {
+          "layer": 0,
+          "mae": 0.032640255987644196,
+          "rmse": 0.044526711106300354,
+          "max_abs": 0.22540336847305298,
+          "rel_l2": 0.40380188822746277,
+          "cosine": 0.9171996116638184,
+          "h": 64,
+          "w": 128,
+          "ph": 66,
+          "pw": 132,
+          "blocks": 242,
+          "astc_bytes": 3872,
+          "min_bytes": 484,
+          "total_bytes": 4356,
+          "astc_bpw_nominal": 3.5555555555555554,
+          "effective_bpw_on_original": 4.25390625
+        },
+        {
+          "layer": 1,
+          "mae": 0.026785332709550858,
+          "rmse": 0.036321625113487244,
+          "max_abs": 0.31485235691070557,
+          "rel_l2": 0.38266438245773315,
+          "cosine": 0.9259292483329773,
+          "rank": 1,
+          "low_rank_bytes": 512,
+          "astc_total_bytes": 8712,
+          "total_bytes": 9224,
+          "effective_bpw_on_original": 4.50390625
+        },
+        {
+          "layer": 2,
+          "mae": 0.0409805066883564,
+          "rmse": 0.057016462087631226,
+          "max_abs": 0.2227933257818222,
+          "rel_l2": 0.4046694040298462,
+          "cosine": 0.9201200008392334,
+          "h": 128,
+          "w": 10,
+          "ph": 132,
+          "pw": 12,
+          "blocks": 44,
+          "astc_bytes": 704,
+          "min_bytes": 88,
+          "total_bytes": 792,
+          "astc_bpw_nominal": 3.5555555555555554,
+          "effective_bpw_on_original": 4.95
+        }
+      ],
+      "total_bytes": 14372,
+      "total_effective_bpw": 4.446782178217822,
+      "test_acc": 0.9388888888888889,
+      "acc_drop_pp": 3.3333333333333326,
+      "logit_rmse": 1.4718605279922485,
+      "logit_mae": 1.0837360620498657
+    },
+    {
+      "rank_on_layer1": 2,
+      "layer_infos": [
+        {
+          "layer": 0,
+          "mae": 0.032640255987644196,
+          "rmse": 0.044526711106300354,
+          "max_abs": 0.22540336847305298,
+          "rel_l2": 0.40380188822746277,
+          "cosine": 0.9171996116638184,
+          "h": 64,
+          "w": 128,
+          "ph": 66,
+          "pw": 132,
+          "blocks": 242,
+          "astc_bytes": 3872,
+          "min_bytes": 484,
+          "total_bytes": 4356,
+          "astc_bpw_nominal": 3.5555555555555554,
+          "effective_bpw_on_original": 4.25390625
+        },
+        {
+          "layer": 1,
+          "mae": 0.026283234357833862,
+          "rmse": 0.035835664719343185,
+          "max_abs": 0.29085594415664673,
+          "rel_l2": 0.3775445818901062,
+          "cosine": 0.9282476305961609,
+          "rank": 2,
+          "low_rank_bytes": 1024,
+          "astc_total_bytes": 8712,
+          "total_bytes": 9736,
+          "effective_bpw_on_original": 4.75390625
+        },
+        {
+          "layer": 2,
+          "mae": 0.0409805066883564,
+          "rmse": 0.057016462087631226,
+          "max_abs": 0.2227933257818222,
+          "rel_l2": 0.4046694040298462,
+          "cosine": 0.9201200008392334,
+          "h": 128,
+          "w": 10,
+          "ph": 132,
+          "pw": 12,
+          "blocks": 44,
+          "astc_bytes": 704,
+          "min_bytes": 88,
+          "total_bytes": 792,
+          "astc_bpw_nominal": 3.5555555555555554,
+          "effective_bpw_on_original": 4.95
+        }
+      ],
+      "total_bytes": 14884,
+      "total_effective_bpw": 4.60519801980198,
+      "test_acc": 0.925,
+      "acc_drop_pp": 4.722222222222216,
+      "logit_rmse": 1.367823600769043,
+      "logit_mae": 1.0140130519866943
+    },
+    {
+      "rank_on_layer1": 4,
+      "layer_infos": [
+        {
+          "layer": 0,
+          "mae": 0.032640255987644196,
+          "rmse": 0.044526711106300354,
+          "max_abs": 0.22540336847305298,
+          "rel_l2": 0.40380188822746277,
+          "cosine": 0.9171996116638184,
+          "h": 64,
+          "w": 128,
+          "ph": 66,
+          "pw": 132,
+          "blocks": 242,
+          "astc_bytes": 3872,
+          "min_bytes": 484,
+          "total_bytes": 4356,
+          "astc_bpw_nominal": 3.5555555555555554,
+          "effective_bpw_on_original": 4.25390625
+        },
+        {
+          "layer": 1,
+          "mae": 0.025630062445998192,
+          "rmse": 0.034960418939590454,
+          "max_abs": 0.20572231709957123,
+          "rel_l2": 0.3683234751224518,
+          "cosine": 0.9319303631782532,
+          "rank": 4,
+          "low_rank_bytes": 2048,
+          "astc_total_bytes": 8712,
+          "total_bytes": 10760,
+          "effective_bpw_on_original": 5.25390625
+        },
+        {
+          "layer": 2,
+          "mae": 0.0409805066883564,
+          "rmse": 0.057016462087631226,
+          "max_abs": 0.2227933257818222,
+          "rel_l2": 0.4046694040298462,
+          "cosine": 0.9201200008392334,
+          "h": 128,
+          "w": 10,
+          "ph": 132,
+          "pw": 12,
+          "blocks": 44,
+          "astc_bytes": 704,
+          "min_bytes": 88,
+          "total_bytes": 792,
+          "astc_bpw_nominal": 3.5555555555555554,
+          "effective_bpw_on_original": 4.95
+        }
+      ],
+      "total_bytes": 15908,
+      "total_effective_bpw": 4.922029702970297,
+      "test_acc": 0.9277777777777778,
+      "acc_drop_pp": 4.444444444444439,
+      "logit_rmse": 1.3485740423202515,
+      "logit_mae": 1.0290054082870483
+    },
+    {
+      "rank_on_layer1": 8,
+      "layer_infos": [
+        {
+          "layer": 0,
+          "mae": 0.032640255987644196,
+          "rmse": 0.044526711106300354,
+          "max_abs": 0.22540336847305298,
+          "rel_l2": 0.40380188822746277,
+          "cosine": 0.9171996116638184,
+          "h": 64,
+          "w": 128,
+          "ph": 66,
+          "pw": 132,
+          "blocks": 242,
+          "astc_bytes": 3872,
+          "min_bytes": 484,
+          "total_bytes": 4356,
+          "astc_bpw_nominal": 3.5555555555555554,
+          "effective_bpw_on_original": 4.25390625
+        },
+        {
+          "layer": 1,
+          "mae": 0.023769361898303032,
+          "rmse": 0.032547108829021454,
+          "max_abs": 0.22003750503063202,
+          "rel_l2": 0.3428981900215149,
+          "cosine": 0.9408529996871948,
+          "rank": 8,
+          "low_rank_bytes": 4096,
+          "astc_total_bytes": 8712,
+          "total_bytes": 12808,
+          "effective_bpw_on_original": 6.25390625
+        },
+        {
+          "layer": 2,
+          "mae": 0.0409805066883564,
+          "rmse": 0.057016462087631226,
+          "max_abs": 0.2227933257818222,
+          "rel_l2": 0.4046694040298462,
+          "cosine": 0.9201200008392334,
+          "h": 128,
+          "w": 10,
+          "ph": 132,
+          "pw": 12,
+          "blocks": 44,
+          "astc_bytes": 704,
+          "min_bytes": 88,
+          "total_bytes": 792,
+          "astc_bpw_nominal": 3.5555555555555554,
+          "effective_bpw_on_original": 4.95
+        }
+      ],
+      "total_bytes": 17956,
+      "total_effective_bpw": 5.555693069306931,
+      "test_acc": 0.925,
+      "acc_drop_pp": 4.722222222222216,
+      "logit_rmse": 1.3574557304382324,
+      "logit_mae": 1.021093487739563
+    },
+    {
+      "rank_on_layer1": 16,
+      "layer_infos": [
+        {
+          "layer": 0,
+          "mae": 0.032640255987644196,
+          "rmse": 0.044526711106300354,
+          "max_abs": 0.22540336847305298,
+          "rel_l2": 0.40380188822746277,
+          "cosine": 0.9171996116638184,
+          "h": 64,
+          "w": 128,
+          "ph": 66,
+          "pw": 132,
+          "blocks": 242,
+          "astc_bytes": 3872,
+          "min_bytes": 484,
+          "total_bytes": 4356,
+          "astc_bpw_nominal": 3.5555555555555554,
+          "effective_bpw_on_original": 4.25390625
+        },
+        {
+          "layer": 1,
+          "mae": 0.021316515281796455,
+          "rmse": 0.029208436608314514,
+          "max_abs": 0.19800469279289246,
+          "rel_l2": 0.3077237606048584,
+          "cosine": 0.9526486396789551,
+          "rank": 16,
+          "low_rank_bytes": 8192,
+          "astc_total_bytes": 8712,
+          "total_bytes": 16904,
+          "effective_bpw_on_original": 8.25390625
+        },
+        {
+          "layer": 2,
+          "mae": 0.0409805066883564,
+          "rmse": 0.057016462087631226,
+          "max_abs": 0.2227933257818222,
+          "rel_l2": 0.4046694040298462,
+          "cosine": 0.9201200008392334,
+          "h": 128,
+          "w": 10,
+          "ph": 132,
+          "pw": 12,
+          "blocks": 44,
+          "astc_bytes": 704,
+          "min_bytes": 88,
+          "total_bytes": 792,
+          "astc_bpw_nominal": 3.5555555555555554,
+          "effective_bpw_on_original": 4.95
+        }
+      ],
+      "total_bytes": 22052,
+      "total_effective_bpw": 6.823019801980198,
+      "test_acc": 0.9333333333333333,
+      "acc_drop_pp": 3.888888888888886,
+      "logit_rmse": 1.3202016353607178,
+      "logit_mae": 0.9855040311813354
+    }
+  ]
+}
