@@ -13,6 +13,7 @@
 // Unity build — include the entire inference engine
 // This gives us access to all static functions and globals
 #include "../../metal_infer/infer.m"
+#include "../../metal_infer/batched_prefill.h"
 
 #include "FlashMoEEngine.h"
 #include <stdatomic.h>
@@ -54,6 +55,11 @@ struct FlashMoEContext {
     int tokens_generated;
     double total_time_ms;
     double ttft_ms;
+
+    // Prefill stats
+    double prefill_ms;           // total prefill time (excluding last token + LM head)
+    int prefill_tokens;          // number of intermediate prefill tokens
+    int prefill_batched;         // 1 if batched path was used
 
     // Error state
     char last_error[512];
@@ -168,6 +174,17 @@ int flashmoe_load(FlashMoEContext *ctx, const FlashMoEConfig *config) {
             g_cache_io_split = 1;  // disabled by default
         }
 
+        // Prefill batching settings
+        g_prefill_batch = config->prefill_batch > 1 ? config->prefill_batch : 1;
+        if (g_prefill_batch > MAX_PFB) g_prefill_batch = MAX_PFB;
+        g_prefill_skip_experts = config->prefill_skip_experts ? 1 : 0;
+        g_prefill_experts_full_only = config->prefill_experts_full_only ? 1 : 0;
+        g_disable_batched_linear = config->prefill_batched_linear ? 0 : 1;
+        if (config->verbose && g_prefill_batch > 1) {
+            NSLog(@"[FlashMoE] Prefill: batch=%d, skip_experts=%d, experts_full_only=%d, batched_linear=%d",
+                  g_prefill_batch, g_prefill_skip_experts, g_prefill_experts_full_only, !g_disable_batched_linear);
+        }
+
         // KV cache sizing — allocate only what we need
         {
             int default_ctx = 8192;
@@ -180,8 +197,10 @@ int flashmoe_load(FlashMoEContext *ctx, const FlashMoEConfig *config) {
             if (ctx_limit > MAX_SEQ_LEN) ctx_limit = MAX_SEQ_LEN;
             g_kv_seq_len = ctx_limit;
             size_t kv_per_cache = (size_t)ctx_limit * g_cfg.num_kv_heads * g_cfg.head_dim * sizeof(float);
-            NSLog(@"[FlashMoE] KV cache: %d positions (%.1f MB per cache x %d layers)",
-                  ctx_limit, kv_per_cache / 1e6, g_cfg.num_full_attn_layers);
+            if (config->verbose) {
+                NSLog(@"[FlashMoE] KV cache: %d positions (%.1f MB per cache x %d layers)",
+                      ctx_limit, kv_per_cache / 1e6, g_cfg.num_full_attn_layers);
+            }
         }
 
         // K = experts per token (override or model default, capped to MAX_K)
@@ -317,8 +336,10 @@ int flashmoe_load(FlashMoEContext *ctx, const FlashMoEConfig *config) {
             for (int i = 0; i < g_cfg.num_layers; i++) {
                 if (ctx->layer_mmaps[i] != MAP_FAILED) mmap_count++;
             }
-            NSLog(@"[experts] %d/%d layers opened, %d mmap'd, %d pread-only",
-                  g_cfg.num_layers, g_cfg.num_layers, mmap_count, g_cfg.num_layers - mmap_count);
+            if (config->verbose) {
+                NSLog(@"[experts] %d/%d layers opened, %d mmap'd, %d pread-only",
+                      g_cfg.num_layers, g_cfg.num_layers, mmap_count, g_cfg.num_layers - mmap_count);
+            }
         }
 
         // Wire up global cold fds
@@ -655,49 +676,89 @@ int flashmoe_generate(
             }
         }
 
-        // ---- Prefill intermediate tokens (discard expert output) ----
+        // ---- Prefill intermediate tokens ----
         if (pt->count > 1) {
             double prefill_start = now_ms();
-            for (int token_idx = 0; token_idx < pt->count - 1; token_idx++) {
-                if (atomic_load(&ctx->cancelled)) {
-                    free(embed_batch);
-                    free(pt->ids); free(pt);
-                    return ctx->tokens_generated;
-                }
+            int num_prefill = pt->count - 1;
 
-                @autoreleasepool {
-                memcpy(ctx->hidden, embed_batch + (size_t)token_idx * HIDDEN_DIM,
-                       HIDDEN_DIM * sizeof(float));
+            if (g_prefill_batch > 1 && (effective_prefill_skip_experts() || g_prefill_experts_full_only)) {
+                NSLog(@"[prefill] BATCHED path: %d tokens, batch=%d, skip_experts=%d, experts_full_only=%d, batched_linear=%d",
+                      num_prefill, g_prefill_batch, effective_prefill_skip_experts(), g_prefill_experts_full_only, !g_disable_batched_linear);
+                pos += batched_prefill_k0(ctx->wf, ctx->hidden, embed_batch, num_prefill, pos,
+                                          ctx->kv_caches, ctx->layer_states,
+                                          ctx->layer_mmaps, ctx->layer_fds, K);
 
-                for (int layer = 0; layer < g_cfg.num_layers; layer++) {
-                    int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
-                    fused_layer_forward(ctx->wf, layer, ctx->hidden,
-                                        is_full ? ctx->kv_caches[layer] : NULL,
-                                        is_full ? NULL : ctx->layer_states[layer],
-                                        pos,
-                                        ctx->layer_mmaps[layer] != MAP_FAILED ? ctx->layer_mmaps[layer] : NULL,
-                                        K, ctx->layer_fds[layer]);
-                }
-                discard_deferred_experts();
-                pos++;
-                } // @autoreleasepool — drain Metal objects per prefill token
-
-                // Report prefill progress via callback
-                double prefill_elapsed = now_ms() - prefill_start;
-                double prefill_tps = prefill_elapsed > 0 ? (token_idx + 1) * 1000.0 / prefill_elapsed : 0;
+                double prefill_total = now_ms() - prefill_start;
+                double prefill_tps = prefill_total > 0 ? num_prefill * 1000.0 / prefill_total : 0;
                 ctx->tokens_per_second = prefill_tps;
-                ctx->tokens_generated = -(token_idx + 1);  // negative = prefill in progress
+                ctx->tokens_generated = -num_prefill;
+                ctx->prefill_ms = prefill_total;
+                ctx->prefill_tokens = num_prefill;
+                ctx->prefill_batched = 1;
                 if (callback) {
-                    char prefill_status[64];
+                    char prefill_status[128];
                     snprintf(prefill_status, sizeof(prefill_status),
-                             "[prefill %d/%d]", token_idx + 1, pt->count - 1);
-                    callback(prefill_status, -1, -(token_idx + 1), prefill_tps, user_data);
+                             "[prefill %d/%d batch=%d linear=%s skip_experts=%d]",
+                             num_prefill, num_prefill, g_prefill_batch,
+                             g_disable_batched_linear ? "per-tok" : "batched",
+                             effective_prefill_skip_experts());
+                    callback(prefill_status, -1, -num_prefill, prefill_tps, user_data);
                 }
+                NSLog(@"[prefill] %d tokens in %.0f ms (%.1f tok/s, batch=%d, batched_linear=%d, skip_experts=%d)",
+                      num_prefill, prefill_total, prefill_tps, g_prefill_batch, !g_disable_batched_linear,
+                      effective_prefill_skip_experts());
+            } else {
+                NSLog(@"[prefill] PER-TOKEN path: batch=%d, skip_experts=%d (batched requires skip_experts=1)",
+                      g_prefill_batch, effective_prefill_skip_experts());
+                for (int token_idx = 0; token_idx < num_prefill; token_idx++) {
+                    if (atomic_load(&ctx->cancelled)) {
+                        free(embed_batch);
+                        free(pt->ids); free(pt);
+                        return ctx->tokens_generated;
+                    }
+
+                    @autoreleasepool {
+                    memcpy(ctx->hidden, embed_batch + (size_t)token_idx * HIDDEN_DIM,
+                           HIDDEN_DIM * sizeof(float));
+
+                    for (int layer = 0; layer < g_cfg.num_layers; layer++) {
+                        int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+                        int layer_K = K;
+                        if (g_prefill_experts_full_only) {
+                            layer_K = is_full ? K : 0;
+                        }
+                        fused_layer_forward(ctx->wf, layer, ctx->hidden,
+                                            is_full ? ctx->kv_caches[layer] : NULL,
+                                            is_full ? NULL : ctx->layer_states[layer],
+                                            pos,
+                                            ctx->layer_mmaps[layer] != MAP_FAILED ? ctx->layer_mmaps[layer] : NULL,
+                                            layer_K, ctx->layer_fds[layer]);
+                    }
+                    discard_deferred_experts();
+                    pos++;
+                    } // @autoreleasepool — drain Metal objects per prefill token
+
+                    double prefill_elapsed = now_ms() - prefill_start;
+                    double prefill_tps = prefill_elapsed > 0 ? (token_idx + 1) * 1000.0 / prefill_elapsed : 0;
+                    ctx->tokens_per_second = prefill_tps;
+                    ctx->tokens_generated = -(token_idx + 1);
+                    if (callback) {
+                        char prefill_status[128];
+                        snprintf(prefill_status, sizeof(prefill_status),
+                                 "[prefill %d/%d per-token configured_batch=%d skip_experts=%d]",
+                                 token_idx + 1, num_prefill, g_prefill_batch, effective_prefill_skip_experts());
+                        callback(prefill_status, -1, -(token_idx + 1), prefill_tps, user_data);
+                    }
+                }
+                double prefill_total = now_ms() - prefill_start;
+                ctx->prefill_ms = prefill_total;
+                ctx->prefill_tokens = num_prefill;
+                ctx->prefill_batched = 0;
+                NSLog(@"[prefill] %d tokens in %.0f ms (%.1f tok/s, batch=1, skip_experts=%d)",
+                      num_prefill, prefill_total,
+                      prefill_total > 0 ? num_prefill * 1000.0 / prefill_total : 0,
+                      effective_prefill_skip_experts());
             }
-            double prefill_total = now_ms() - prefill_start;
-            NSLog(@"[prefill] %d tokens in %.0f ms (%.1f tok/s)",
-                  pt->count - 1, prefill_total,
-                  prefill_total > 0 ? (pt->count - 1) * 1000.0 / prefill_total : 0);
         }
 
         // ---- Last prefill token (need full hidden state) ----
@@ -906,29 +967,40 @@ int flashmoe_generate_continuation(
         }
 
         if (pt->count > 1) {
-            for (int token_idx = 0; token_idx < pt->count - 1; token_idx++) {
-                if (atomic_load(&ctx->cancelled)) {
-                    free(embed_batch);
-                    free(pt->ids); free(pt);
-                    return ctx->tokens_generated;
-                }
+            int num_prefill = pt->count - 1;
+            if (g_prefill_batch > 1 && (effective_prefill_skip_experts() || g_prefill_experts_full_only)) {
+                pos += batched_prefill_k0(ctx->wf, ctx->hidden, embed_batch, num_prefill, pos,
+                                          ctx->kv_caches, ctx->layer_states,
+                                          ctx->layer_mmaps, ctx->layer_fds, K);
+            } else {
+                for (int token_idx = 0; token_idx < num_prefill; token_idx++) {
+                    if (atomic_load(&ctx->cancelled)) {
+                        free(embed_batch);
+                        free(pt->ids); free(pt);
+                        return ctx->tokens_generated;
+                    }
 
-                @autoreleasepool {
-                memcpy(ctx->hidden, embed_batch + (size_t)token_idx * HIDDEN_DIM,
-                       HIDDEN_DIM * sizeof(float));
+                    @autoreleasepool {
+                    memcpy(ctx->hidden, embed_batch + (size_t)token_idx * HIDDEN_DIM,
+                           HIDDEN_DIM * sizeof(float));
 
-                for (int layer = 0; layer < g_cfg.num_layers; layer++) {
-                    int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
-                    fused_layer_forward(ctx->wf, layer, ctx->hidden,
-                                        is_full ? ctx->kv_caches[layer] : NULL,
-                                        is_full ? NULL : ctx->layer_states[layer],
-                                        pos,
-                                        ctx->layer_mmaps[layer] != MAP_FAILED ? ctx->layer_mmaps[layer] : NULL,
-                                        K, ctx->layer_fds[layer]);
+                    for (int layer = 0; layer < g_cfg.num_layers; layer++) {
+                        int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+                        int layer_K = K;
+                        if (g_prefill_experts_full_only) {
+                            layer_K = is_full ? K : 0;
+                        }
+                        fused_layer_forward(ctx->wf, layer, ctx->hidden,
+                                            is_full ? ctx->kv_caches[layer] : NULL,
+                                            is_full ? NULL : ctx->layer_states[layer],
+                                            pos,
+                                            ctx->layer_mmaps[layer] != MAP_FAILED ? ctx->layer_mmaps[layer] : NULL,
+                                            layer_K, ctx->layer_fds[layer]);
+                    }
+                    discard_deferred_experts();
+                    pos++;
+                    } // @autoreleasepool
                 }
-                discard_deferred_experts();
-                pos++;
-                } // @autoreleasepool
             }
         }
 
@@ -1110,6 +1182,7 @@ void flashmoe_get_stats(FlashMoEContext *ctx, FlashMoEStats *stats) {
         stats->num_full_attn_layers = g_cfg.num_full_attn_layers;
         stats->num_experts = g_cfg.num_experts;
         stats->active_experts_k = ctx->K;
+        stats->default_experts_k = g_cfg.num_experts_per_tok;
         stats->hidden_dim = HIDDEN_DIM;
         stats->vocab_size = VOCAB_SIZE;
         stats->num_attn_heads = g_cfg.num_attn_heads;
@@ -1148,6 +1221,11 @@ void flashmoe_get_stats(FlashMoEContext *ctx, FlashMoEStats *stats) {
     stats->tokens_generated = ctx->tokens_generated;
     stats->total_time_ms = ctx->total_time_ms;
     stats->ttft_ms = ctx->ttft_ms;
+
+    stats->prefill_ms = ctx->prefill_ms;
+    stats->prefill_tokens = ctx->prefill_tokens;
+    stats->prefill_tps = ctx->prefill_ms > 0 ? ctx->prefill_tokens * 1000.0 / ctx->prefill_ms : 0;
+    stats->prefill_batched = ctx->prefill_batched;
 }
 
 // ============================================================================
@@ -1302,12 +1380,16 @@ char *flashmoe_timing_report(FlashMoEContext *ctx) {
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "Total per token:    %5.1f ms  (%.1f tok/s)\n"
         "TTFT:               %5.0f ms\n"
+        "Prefill:            %5.0f ms  (%d tokens, %.1f tok/s%s)\n"
         "Expert quant:       %d-bit\n"
         "Experts:            %d (K=%d)\n"
         "Expert I/O/tok:     %.2f GB\n"
         "SSD throughput:     %.1f GB/s\n",
         total_ms, 1000.0/total_ms,
         ctx->ttft_ms,
+        ctx->prefill_ms, ctx->prefill_tokens,
+        ctx->prefill_ms > 0 ? ctx->prefill_tokens * 1000.0 / ctx->prefill_ms : 0,
+        ctx->prefill_batched ? ", batched" : "",
         g_use_2bit ? 2 : (g_use_q3_experts ? 3 : 4),
         g_cfg.num_experts, ctx->K,
         io_gb_per_tok, ssd_gbps);
@@ -1404,4 +1486,3 @@ const char *flashmoe_last_error(FlashMoEContext *ctx) {
     if (!ctx) return "NULL context";
     return ctx->last_error;
 }
-

@@ -32,9 +32,15 @@ struct ModelListView: View {
     @State private var selectedModel: LocalModel?
     @AppStorage("cacheIOSplit") private var cacheIOSplit: Int = 4
     @AppStorage("chatTemplateEnabled") private var chatTemplateEnabled: Bool = true
+    @AppStorage("noThinkingEnabled") private var noThinkingEnabled: Bool = false
     @AppStorage("lastModelPath") private var lastModelPath: String = ""
     @AppStorage("maxGenerationTokens") private var maxGenerationTokens: Int = 2048
     @AppStorage("activeExpertsK") private var activeExpertsK: Int = 4
+    @AppStorage("prefillBatchSize") private var prefillBatchSize: Int = 64
+    @AppStorage("prefillBatchedLinearV3") private var prefillBatchedLinear: Bool = true
+    @AppStorage("prefillSkipExperts") private var prefillSkipExperts: Bool = true
+    @AppStorage("showProfilerPanel") private var showProfilerPanel: Bool = false
+    @AppStorage("prefillExpertsFullOnly") private var prefillExpertsFullOnly: Bool = true
     @AppStorage("gpuCombineEnabled") private var gpuCombineEnabled: Bool = true
     @AppStorage("gpuLinearAttnEnabled") private var gpuLinearAttnEnabled: Bool = true
     @AppStorage("expertPrefetchEnabled") private var expertPrefetchEnabled: Bool = true
@@ -116,9 +122,47 @@ struct ModelListView: View {
                 }
             }
 
+            Section("Prefill") {
+                Picker("Batch Size", selection: $prefillBatchSize) {
+                    Text("Off (per-token)").tag(1)
+                    Text("16 tokens").tag(16)
+                    Text("32 tokens").tag(32)
+                    Text("64 tokens (recommended)").tag(64)
+                    Text("128 tokens").tag(128)
+                    Text("256 tokens").tag(256)
+                }
+                .pickerStyle(.menu)
+
+                Toggle("Skip Routed Experts", isOn: $prefillSkipExperts)
+
+                Text("Uses shared expert only during prefill. Enables batched prefill (much faster TTFT). For 2-bit models, this often improves quality (noisy experts add noise). Disable if output quality drops on 4-bit models.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Toggle("Experts at Full Attention Only", isOn: $prefillExpertsFullOnly)
+                    .disabled(prefillSkipExperts)
+
+                Text("Loads routed experts only at full attention layers (25% of layers). Saves 75% expert I/O while preserving quality where it matters most. Only applies when Skip Routed Experts is off.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Toggle("Batched Linear Attention", isOn: $prefillBatchedLinear)
+                    .disabled(!prefillSkipExperts && !prefillExpertsFullOnly)
+
+                Text("Batches linear attention layers during prefill. Enabled when Skip Routed Experts or Experts at Full Attention Only is on. Reload model to apply.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             Section("Chat Settings") {
                 Toggle("Chat Template", isOn: $chatTemplateEnabled)
                 Text("Wraps prompts in Qwen chat format (<|im_start|>). Disable for smoke test models or raw text mode.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Toggle("No Thinking", isOn: $noThinkingEnabled)
+                    .disabled(!chatTemplateEnabled)
+                Text("Skip reasoning — pre-fills empty <think></think> block so the model responds directly. Faster but may reduce quality on complex tasks.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -133,6 +177,13 @@ struct ModelListView: View {
                 }
                 .pickerStyle(.menu)
                 Text("Maximum tokens per response. Higher values allow longer replies but take more time.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Display") {
+                Toggle("Show Profiler Panel", isOn: $showProfilerPanel)
+                Text("Shows the profiler overlay (RSS, CPU, tok/s, TTFT, prefill) in the chat view. Persists across restarts.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -224,6 +275,10 @@ struct ModelListView: View {
                     use2bit: model.has2bit && !model.hasTiered && !model.has4bit,
                     cacheIOSplit: cacheIOSplit,
                     activeK: activeExpertsK,
+                    prefillBatch: prefillBatchSize,
+                    prefillBatchedLinear: prefillBatchedLinear,
+                    prefillSkipExperts: prefillSkipExperts,
+                    prefillExpertsFullOnly: prefillExpertsFullOnly,
                     verbose: true
                 )
                 // Apply optimization toggles

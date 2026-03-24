@@ -39,6 +39,10 @@ typedef struct {
     int use_2bit;               // 1 = use 2-bit experts (packed_experts_2bit/)
     int cache_io_split;         // >1 = split each expert pread into N page-aligned chunks (fanout), 0/1 = disabled
     int active_k;               // Override active experts per token (0 = use model default, capped to MAX_K)
+    int prefill_batch;          // Prefill batch size (0/1 = per-token, >1 = batch N tokens per layer)
+    int prefill_skip_experts;   // 1 = skip routed experts for intermediate prefill tokens (shared expert only)
+    int prefill_experts_full_only; // 1 = load routed experts only at full attention layers during prefill
+    int prefill_batched_linear; // 1 = batch linear attention layers during prefill (0 = per-token fallback)
     int verbose;                // 1 = log to stderr, 0 = quiet
 } FlashMoEConfig;
 
@@ -51,6 +55,7 @@ typedef struct {
     int num_full_attn_layers;
     int num_experts;
     int active_experts_k;
+    int default_experts_k;      // model's num_experts_per_tok
     int hidden_dim;
     int vocab_size;
     int num_attn_heads;
@@ -67,6 +72,12 @@ typedef struct {
     int tokens_generated;
     double total_time_ms;
     double ttft_ms;             // Time to first token
+
+    // Prefill stats
+    double prefill_ms;          // Prefill time (intermediate tokens only)
+    int prefill_tokens;         // Number of intermediate prefill tokens
+    double prefill_tps;         // Prefill tokens per second
+    int prefill_batched;        // 1 if batched path was used
 
     // Memory
     size_t weight_file_bytes;   // Non-expert weights (mmap'd)

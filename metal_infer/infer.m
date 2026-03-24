@@ -496,11 +496,24 @@ static int g_think_budget = 2048; // max thinking tokens before force-emitting <
 static int g_stream_mode = 0;    // --stream: clean output only, no progress/stats
 static int g_nax_disabled = 1;   // NAX disabled by default (slower for M=1 decode); --nax to enable
 
+// ---- Prefill batching ----
+static int g_prefill_batch = 1;  // --pfb N: batch N tokens per layer during prefill (default 1 = no batching)
+static int g_prefill_skip_experts = 0; // --prefill-skip-experts: skip routed expert I/O during intermediate prefill tokens
+static int g_prefill_k = -1;  // --prefill-k N: override K for intermediate prefill tokens (-1 = use default)
+static int g_prefill_experts_full_only = 0; // --prefill-experts-full-only: K=0 for linear layers, full K for full-attn layers
+#define MAX_PFB 256              // maximum prefill batch size
+#define MAX_PFB_GPU 32           // current dequant_gemm_4bit_batch kernel accumulator limit
+
 // ---- Optimization toggles (for A/B profiling) ----
 static int g_disable_gpu_combine = 0;    // disable fused CMD3 combine+residual+norm on GPU
 static int g_disable_fused_experts = 0;  // disable batched expert GPU encoding (fall back to sequential)
 static int g_disable_expert_prefetch = 0;// disable async pread prefetch (use synchronous pread)
+static int g_disable_batched_linear = 0; // set to 1 to disable batched linear prefill (A/B testing)
 // gpu_linear_attn_enabled already exists (line ~4629) for fused attention toggle
+
+static inline int effective_prefill_skip_experts(void) {
+    return g_prefill_skip_experts;
+}
 
 // Tiered I/O: cold fds (F_NOCACHE) for first reads, warm fds (page cached) for repeats
 static int *g_layer_fds_cold = NULL;    // [NUM_LAYERS] cold fds (set in main)
@@ -546,6 +559,27 @@ typedef struct {
     ExpertProjectionKind down_kind;
 } ExpertLayout;
 
+static ExpertLayout g_q3_layer_layouts[MAX_LAYERS];
+static int g_q3_layer_layout_valid[MAX_LAYERS];
+static int g_q3_layout_manifest_loaded = 0;
+static ExpertLayout g_active_q3_layout;
+static int g_active_q3_layout_valid = 0;
+
+static inline ExpertProjectionKind expert_projection_kind_from_quant_name(const char *quant_name) {
+    if (!quant_name) return EXPERT_PROJ_AFFINE;
+    if (strcmp(quant_name, "IQ3_XXS") == 0) return EXPERT_PROJ_IQ3_XXS;
+    if (strcmp(quant_name, "IQ4_XS") == 0) return EXPERT_PROJ_IQ4_XS;
+    if (strcmp(quant_name, "Q5_K") == 0) return EXPERT_PROJ_Q5_K;
+    return EXPERT_PROJ_AFFINE;
+}
+
+static inline int expert_layout_is_q3_outlier(const ExpertLayout *layout) {
+    if (!layout) return 0;
+    return layout->gate_kind == EXPERT_PROJ_IQ4_XS ||
+           layout->up_kind == EXPERT_PROJ_IQ4_XS ||
+           layout->down_kind == EXPERT_PROJ_Q5_K;
+}
+
 static inline ExpertQuantKind active_expert_quant_kind(void) {
     if (g_use_q3_outlier) return EXPERT_QUANT_Q3_OUTLIER;
     if (g_use_q3_experts) return EXPERT_QUANT_Q3_HYBRID;
@@ -568,6 +602,160 @@ static inline ExpertQuantKind tiered_expert_quant_kind(int layer, int expert) {
     return layer_expert_quant_kind(layer);
 }
 
+static int parse_q3_layout_components(NSArray *components, size_t expert_size, ExpertLayout *layout_out) {
+    if (!components || !layout_out) return 0;
+    ExpertLayout layout = {0};
+    layout.expert_size = expert_size;
+    int have_gate = 0, have_up = 0, have_down = 0;
+
+    for (NSDictionary *comp in components) {
+        NSString *name = comp[@"name"];
+        NSString *quant = comp[@"quant"];
+        NSNumber *offset_num = comp[@"offset"];
+        if (!name || !quant || !offset_num) continue;
+        NSUInteger off = (NSUInteger)[offset_num unsignedLongLongValue];
+        ExpertProjectionKind kind = expert_projection_kind_from_quant_name([quant UTF8String]);
+        if ([name isEqualToString:@"gate_proj.weight"]) {
+            layout.gate_w_off = off;
+            layout.gate_s_off = off;
+            layout.gate_b_off = off;
+            layout.gate_kind = kind;
+            have_gate = 1;
+        } else if ([name isEqualToString:@"up_proj.weight"]) {
+            layout.up_w_off = off;
+            layout.up_s_off = off;
+            layout.up_b_off = off;
+            layout.up_kind = kind;
+            have_up = 1;
+        } else if ([name isEqualToString:@"down_proj.weight"]) {
+            layout.down_w_off = off;
+            layout.down_s_off = off;
+            layout.down_b_off = off;
+            layout.down_kind = kind;
+            have_down = 1;
+        }
+    }
+
+    if (!have_gate || !have_up || !have_down) return 0;
+    *layout_out = layout;
+    return 1;
+}
+
+static int load_q3_layout_manifest(const char *model_path) {
+    @autoreleasepool {
+        memset(g_q3_layer_layout_valid, 0, sizeof(g_q3_layer_layout_valid));
+        g_q3_layout_manifest_loaded = 0;
+
+        char manifest_path[1024];
+        snprintf(manifest_path, sizeof(manifest_path),
+                 "%s/packed_experts_Q3/layout.json", model_path);
+
+        NSData *data = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:manifest_path]];
+        if (!data) return 0;
+
+        NSError *err = nil;
+        NSDictionary *root = [NSJSONSerialization JSONObjectWithData:data options:0 error:&err];
+        if (!root || err) {
+            fprintf(stderr, "[q3] Failed to parse %s\n", manifest_path);
+            return 0;
+        }
+
+        NSNumber *num_layers_num = root[@"num_layers"];
+        NSNumber *num_experts_num = root[@"num_experts"];
+        if (num_layers_num && [num_layers_num intValue] != NUM_LAYERS) {
+            fprintf(stderr, "[q3] layout.json num_layers=%d vs config %d\n",
+                    [num_layers_num intValue], NUM_LAYERS);
+            return 0;
+        }
+        if (num_experts_num && [num_experts_num intValue] != NUM_EXPERTS) {
+            fprintf(stderr, "[q3] layout.json num_experts=%d vs config %d\n",
+                    [num_experts_num intValue], NUM_EXPERTS);
+            return 0;
+        }
+
+        NSDictionary *layers = root[@"layers"];
+        if ([layers isKindOfClass:[NSDictionary class]] && [layers count] > 0) {
+            for (NSString *layer_key in layers) {
+                int layer = [layer_key intValue];
+                if (layer < 0 || layer >= NUM_LAYERS) continue;
+                NSDictionary *layer_info = layers[layer_key];
+                NSNumber *expert_size_num = layer_info[@"expert_size"];
+                NSArray *components = layer_info[@"components"];
+                if (!expert_size_num || !components) continue;
+                ExpertLayout layout = {0};
+                if (!parse_q3_layout_components(components, (size_t)[expert_size_num unsignedLongLongValue], &layout)) {
+                    fprintf(stderr, "[q3] Invalid components in layer %d manifest entry\n", layer);
+                    return 0;
+                }
+                g_q3_layer_layouts[layer] = layout;
+                g_q3_layer_layout_valid[layer] = 1;
+            }
+            g_q3_layout_manifest_loaded = 1;
+            return 1;
+        }
+
+        // Backward-compatible parser for the original 397B manifest shape.
+        NSNumber *expert_size_num = root[@"expert_size"];
+        NSArray *components = root[@"components"];
+        if (!expert_size_num || !components) return 0;
+
+        ExpertLayout default_layout = {0};
+        if (!parse_q3_layout_components(components, (size_t)[expert_size_num unsignedLongLongValue], &default_layout)) {
+            fprintf(stderr, "[q3] Invalid default components in %s\n", manifest_path);
+            return 0;
+        }
+        for (int layer = 0; layer < NUM_LAYERS; layer++) {
+            g_q3_layer_layouts[layer] = default_layout;
+            g_q3_layer_layout_valid[layer] = 1;
+        }
+
+        NSDictionary *outlier_layers = root[@"outlier_layers"];
+        if ([outlier_layers isKindOfClass:[NSDictionary class]]) {
+            for (NSString *layer_key in outlier_layers) {
+                int layer = [layer_key intValue];
+                if (layer < 0 || layer >= NUM_LAYERS) continue;
+                NSDictionary *layer_info = outlier_layers[layer_key];
+                NSNumber *layer_expert_size_num = layer_info[@"expert_size"];
+                NSArray *layer_components = layer_info[@"components"];
+                if (!layer_expert_size_num || !layer_components) continue;
+                ExpertLayout outlier_layout = {0};
+                if (!parse_q3_layout_components(layer_components, (size_t)[layer_expert_size_num unsignedLongLongValue], &outlier_layout)) {
+                    fprintf(stderr, "[q3] Invalid outlier components for layer %d\n", layer);
+                    return 0;
+                }
+                g_q3_layer_layouts[layer] = outlier_layout;
+                g_q3_layer_layout_valid[layer] = 1;
+            }
+        }
+
+        g_q3_layout_manifest_loaded = 1;
+        return 1;
+    }
+}
+
+static inline size_t default_q3_expert_size(void) {
+    if (g_q3_layout_manifest_loaded) {
+        for (int layer = 0; layer < NUM_LAYERS; layer++) {
+            if (g_q3_layer_layout_valid[layer]) {
+                return g_q3_layer_layouts[layer].expert_size;
+            }
+        }
+    }
+    return g_use_q3_outlier ? EXPERT_SIZE_Q3_OUTLIER : EXPERT_SIZE_Q3_HYBRID;
+}
+
+static inline size_t max_q3_expert_size(void) {
+    size_t max_size = 0;
+    if (g_q3_layout_manifest_loaded) {
+        for (int layer = 0; layer < NUM_LAYERS; layer++) {
+            if (g_q3_layer_layout_valid[layer] && g_q3_layer_layouts[layer].expert_size > max_size) {
+                max_size = g_q3_layer_layouts[layer].expert_size;
+            }
+        }
+    }
+    return max_size ? max_size : EXPERT_SIZE_Q3_OUTLIER;
+}
+
 static inline ExpertLayout expert_layout_for_kind(ExpertQuantKind kind) {
     switch (kind) {
         case EXPERT_QUANT_2BIT:
@@ -581,6 +769,7 @@ static inline ExpertLayout expert_layout_for_kind(ExpertQuantKind kind) {
                 .down_kind = EXPERT_PROJ_AFFINE,
             };
         case EXPERT_QUANT_Q3_HYBRID:
+            if (g_active_q3_layout_valid) return g_active_q3_layout;
             return (ExpertLayout) {
                 .expert_size = EXPERT_SIZE_Q3_HYBRID,
                 .gate_w_off = GATE_W_OFF_Q3, .gate_s_off = GATE_W_OFF_Q3, .gate_b_off = GATE_W_OFF_Q3,
@@ -591,6 +780,7 @@ static inline ExpertLayout expert_layout_for_kind(ExpertQuantKind kind) {
                 .down_kind = EXPERT_PROJ_IQ4_XS,
             };
         case EXPERT_QUANT_Q3_OUTLIER:
+            if (g_active_q3_layout_valid) return g_active_q3_layout;
             return (ExpertLayout) {
                 .expert_size = EXPERT_SIZE_Q3_OUTLIER,
                 .gate_w_off = GATE_W_OFF_Q3_OUTLIER, .gate_s_off = GATE_W_OFF_Q3_OUTLIER, .gate_b_off = GATE_W_OFF_Q3_OUTLIER,
@@ -632,15 +822,25 @@ static inline const char *requested_expert_quant_label(void) {
 }
 
 static inline size_t active_expert_size(void) {
+    if ((g_use_q3_experts || g_use_q3_outlier) && g_active_q3_layout_valid) {
+        return g_active_q3_layout.expert_size;
+    }
+    if ((g_use_q3_experts || g_use_q3_outlier) && g_q3_layout_manifest_loaded) {
+        return default_q3_expert_size();
+    }
     return expert_layout_for_kind(active_expert_quant_kind()).expert_size;
 }
 
 static inline size_t layer_expert_size(int layer) {
+    if ((g_layer_is_q3_hybrid[layer] || g_layer_is_q3_outlier[layer]) &&
+        g_q3_layout_manifest_loaded && g_q3_layer_layout_valid[layer]) {
+        return g_q3_layer_layouts[layer].expert_size;
+    }
     return expert_layout_for_kind(layer_expert_quant_kind(layer)).expert_size;
 }
 
 static inline size_t max_expert_size_for_current_config(void) {
-    if (g_use_q3_experts) return EXPERT_SIZE_Q3_OUTLIER;
+    if (g_use_q3_experts) return max_q3_expert_size();
     return EXPERT_SIZE;
 }
 static int g_freq_total_tokens = 0;  // total tokens processed while tracking
@@ -2516,11 +2716,24 @@ typedef struct {
     id<MTLBuffer>               nax_x_half;    // input converted to half (padded to 32 rows)
     id<MTLBuffer>               nax_c_buf;     // padded output buffer [32, VOCAB_SIZE]
     int                         has_nax;       // 1 if NAX hardware available
+    // Batched prefill GEMM
+    id<MTLComputePipelineState> gemm_batch;    // dequant_gemm_4bit_batch kernel
+    id<MTLBuffer>               buf_pfb_input; // [MAX_PFB * HIDDEN_DIM floats] batched input
+    id<MTLBuffer>               buf_pfb_out[8];// [MAX_PFB * max_proj_dim floats] per projection slot
+
     id<MTLComputePipelineState> rms_norm_sum;
     id<MTLComputePipelineState> rms_norm_apply;
     id<MTLComputePipelineState> rms_norm_apply_bf16;
     id<MTLComputePipelineState> residual_add;
     id<MTLComputePipelineState> swiglu;
+    // Prefill kernels
+    id<MTLComputePipelineState> prefill_causal_attn;
+    id<MTLComputePipelineState> prefill_rms_norm;
+    id<MTLComputePipelineState> prefill_residual_norm;
+    id<MTLComputePipelineState> prefill_swiglu;
+    id<MTLComputePipelineState> prefill_combine;
+    id<MTLComputePipelineState> prefill_q_rope_norm;
+    id<MTLComputePipelineState> prefill_kv_cache;
     // GPU attention pipelines
     id<MTLComputePipelineState> attn_scores_pipe;
     id<MTLComputePipelineState> attn_softmax_pipe;
@@ -2550,7 +2763,7 @@ typedef struct {
     // Each expert k uses slot [k].
     // Double-buffered: set A (data) for GPU compute, set B (data_B) for background pread.
     // Gate/up/act/out only need one set (GPU uses them after pread completes).
-    #define MAX_K 8
+    // MAX_K defined globally (16) — expert buffer slots
     id<MTLBuffer> buf_multi_expert_data[MAX_K];   // [EXPERT_SIZE bytes] each — buffer set A
     id<MTLBuffer> buf_multi_expert_data_B[MAX_K]; // [EXPERT_SIZE bytes] each — buffer set B (prefetch)
     id<MTLBuffer> buf_multi_expert_gate[MAX_K];   // [MOE_INTERMEDIATE floats]
@@ -2585,10 +2798,15 @@ typedef struct {
     uint64_t event_value;                // monotonically increasing event counter
     // GPU delta-net (gated_delta_net_step) and conv1d pipelines
     id<MTLComputePipelineState> delta_net_step;  // gated_delta_net_step kernel
+    id<MTLComputePipelineState> delta_net_step_batched;  // prefill chunked gated-delta kernel
     id<MTLComputePipelineState> conv1d_step;     // conv1d_step kernel
+    id<MTLComputePipelineState> conv1d_step_batched;     // prefill chunked conv1d kernel
     id<MTLComputePipelineState> rms_norm_qk;     // per-head RMS normalize for q and k
+    id<MTLComputePipelineState> rms_norm_qk_batched;     // batched per-head RMS normalize
     id<MTLComputePipelineState> compute_decay_beta; // g_decay and beta_gate for delta-net
+    id<MTLComputePipelineState> compute_decay_beta_batched; // batched g_decay and beta_gate
     id<MTLComputePipelineState> gated_rms_norm;  // z-gated output normalization
+    id<MTLComputePipelineState> gated_rms_norm_batched;  // batched z-gated output normalization
     // Persistent GPU state buffers for linear attention layers
     id<MTLBuffer> buf_delta_state[48];   // [v_heads*k_dim*v_dim] float per layer (max 48)
     id<MTLBuffer> buf_conv_state[48];   // [conv_kernel*conv_dim] float per layer (max 48)
@@ -2677,6 +2895,14 @@ static MetalCtx *metal_setup(void) {
         return ps;
     };
 
+    ctx->gemm_batch    = makePipe(@"dequant_gemm_4bit_batch");
+    ctx->prefill_causal_attn = makePipe(@"prefill_causal_attn");
+    ctx->prefill_rms_norm    = makePipe(@"prefill_rms_norm_bf16");
+    ctx->prefill_residual_norm = makePipe(@"prefill_residual_norm_bf16");
+    ctx->prefill_swiglu      = makePipe(@"prefill_swiglu");
+    ctx->prefill_combine     = makePipe(@"prefill_combine");
+    ctx->prefill_q_rope_norm = makePipe(@"prefill_q_rope_norm_bf16");
+    ctx->prefill_kv_cache    = makePipe(@"prefill_kv_cache_bf16");
     ctx->matvec_v3     = makePipe(@"dequant_matvec_4bit_v3");
     ctx->matvec_v5     = makePipe(@"dequant_matvec_4bit_v5");  // LUT variant (no uint→float conversions)
     ctx->matvec_fast   = makePipe(@"dequant_matvec_4bit_fast");
@@ -2697,16 +2923,28 @@ static MetalCtx *metal_setup(void) {
     ctx->sigmoid_gate_pipe = makePipe(@"sigmoid_gate");
     ctx->moe_combine_residual = makePipe(@"moe_combine_residual");
     ctx->delta_net_step    = makePipe(@"gated_delta_net_step");
+    ctx->delta_net_step_batched = makePipe(@"gated_delta_net_step_batched");
     ctx->conv1d_step       = makePipe(@"conv1d_step");
+    ctx->conv1d_step_batched = makePipe(@"conv1d_step_batched");
     ctx->rms_norm_qk       = makePipe(@"rms_norm_qk");
+    ctx->rms_norm_qk_batched = makePipe(@"rms_norm_qk_batched");
     ctx->compute_decay_beta = makePipe(@"compute_decay_beta");
+    ctx->compute_decay_beta_batched = makePipe(@"compute_decay_beta_batched");
     ctx->gated_rms_norm    = makePipe(@"gated_rms_norm");
+    ctx->gated_rms_norm_batched = makePipe(@"gated_rms_norm_batched");
     if (!ctx->moe_combine_residual) fprintf(stderr, "[metal] WARNING: moe_combine_residual pipeline failed\n");
+    if (!ctx->prefill_q_rope_norm) fprintf(stderr, "[metal] WARNING: prefill_q_rope_norm_bf16 pipeline failed (prefill fallback)\n");
+    if (!ctx->prefill_kv_cache) fprintf(stderr, "[metal] WARNING: prefill_kv_cache_bf16 pipeline failed (prefill fallback)\n");
     if (!ctx->delta_net_step) fprintf(stderr, "[metal] WARNING: gated_delta_net_step pipeline failed (CPU fallback)\n");
+    if (!ctx->delta_net_step_batched) fprintf(stderr, "[metal] WARNING: gated_delta_net_step_batched pipeline failed (prefill fallback)\n");
     if (!ctx->conv1d_step)    fprintf(stderr, "[metal] WARNING: conv1d_step pipeline failed (CPU fallback)\n");
+    if (!ctx->conv1d_step_batched) fprintf(stderr, "[metal] WARNING: conv1d_step_batched pipeline failed (prefill fallback)\n");
     if (!ctx->rms_norm_qk)       fprintf(stderr, "[metal] WARNING: rms_norm_qk pipeline failed (CPU fallback)\n");
+    if (!ctx->rms_norm_qk_batched) fprintf(stderr, "[metal] WARNING: rms_norm_qk_batched pipeline failed (prefill fallback)\n");
     if (!ctx->compute_decay_beta) fprintf(stderr, "[metal] WARNING: compute_decay_beta pipeline failed (CPU fallback)\n");
+    if (!ctx->compute_decay_beta_batched) fprintf(stderr, "[metal] WARNING: compute_decay_beta_batched pipeline failed (prefill fallback)\n");
     if (!ctx->gated_rms_norm)     fprintf(stderr, "[metal] WARNING: gated_rms_norm pipeline failed (CPU fallback)\n");
+    if (!ctx->gated_rms_norm_batched) fprintf(stderr, "[metal] WARNING: gated_rms_norm_batched pipeline failed (prefill fallback)\n");
 
     // ---- NAX (Metal 4 / M5+) ----
     ctx->has_nax = 0;
@@ -2919,6 +3157,29 @@ static MetalCtx *metal_setup(void) {
     // Create shared event for CPU-GPU async pipeline
     ctx->pipeline_event = [ctx->device newSharedEvent];
     ctx->event_value = 0;
+
+    // ---- Prefill batch buffers ----
+    if (g_prefill_batch > 1 && ctx->gemm_batch) {
+        size_t pfb = g_prefill_batch;
+        // Input buffer: N × hidden_dim floats
+        ctx->buf_pfb_input = [ctx->device newBufferWithLength:pfb * MAX_HIDDEN_DIM * sizeof(float)
+                                                      options:MTLResourceStorageModeShared];
+        // Output slots for projections (largest = QKV at 12288 or Q at 16384)
+        size_t max_proj = 16384;  // NUM_ATTN_HEADS * HEAD_DIM * 2 for full attn Q
+        for (int i = 0; i < 8; i++) {
+            ctx->buf_pfb_out[i] = [ctx->device newBufferWithLength:pfb * max_proj * sizeof(float)
+                                                           options:MTLResourceStorageModeShared];
+        }
+        printf("[metal] Prefill batch buffers allocated (pfb=%d, %.1f MB)\n",
+               (int)pfb, (pfb * MAX_HIDDEN_DIM + pfb * max_proj * 8) * sizeof(float) / 1e6);
+        if (g_prefill_batch > 1) {
+            printf("[metal] Prefill config: batch=%d, skip_experts=%d, batched_linear=%d\n",
+                   g_prefill_batch, effective_prefill_skip_experts(), !g_disable_batched_linear);
+        }
+        if (g_prefill_batch > MAX_PFB_GPU) {
+            printf("[metal] Prefill GPU chunk size capped at %d tokens per dispatch\n", MAX_PFB_GPU);
+        }
+    }
 
     printf("[metal] Inference pipelines ready (multi-expert[%d] + shared buffers allocated)\n", MAX_K);
     return ctx;
@@ -3537,6 +3798,58 @@ static void gpu_encode_batch_matvec(
         }
         [enc endEncoding];
     }
+}
+
+// Encode a batched GEMM: project N tokens through one weight matrix.
+// Input: buf_pfb_input [N, in_dim], Output: buf_pfb_out[slot] [N, out_dim]
+// Weight is 4-bit packed, read from wf_buf.
+// Encode a batched GEMM: project N tokens through one 4-bit weight matrix.
+// Input: in_buf [N * in_dim floats], Output: out_buf [N * out_dim floats]
+// Weight is 4-bit packed in wf_buf.
+static void gpu_encode_pfb_gemm_ex(
+    MetalCtx *ctx,
+    id<MTLCommandBuffer> cmdbuf,
+    const uint32_t *W, const uint16_t *scales, const uint16_t *biases,
+    uint32_t out_dim, uint32_t in_dim, uint32_t group_size,
+    int batch_n,
+    id<MTLBuffer> in_buf, NSUInteger in_offset,
+    id<MTLBuffer> out_buf, NSUInteger out_offset
+) {
+    if (!ctx->gemm_batch || !ctx->wf_buf) return;
+    NSUInteger w_off = (NSUInteger)((const char *)W      - (const char *)[ctx->wf_buf contents]);
+    NSUInteger s_off = (NSUInteger)((const char *)scales  - (const char *)[ctx->wf_buf contents]);
+    NSUInteger b_off = (NSUInteger)((const char *)biases  - (const char *)[ctx->wf_buf contents]);
+    uint32_t bn = (uint32_t)batch_n;
+
+    id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+    [enc setComputePipelineState:ctx->gemm_batch];
+    [enc setBuffer:ctx->wf_buf offset:w_off     atIndex:0];
+    [enc setBuffer:ctx->wf_buf offset:s_off     atIndex:1];
+    [enc setBuffer:ctx->wf_buf offset:b_off     atIndex:2];
+    [enc setBuffer:in_buf      offset:in_offset atIndex:3];
+    [enc setBuffer:out_buf     offset:out_offset atIndex:4];
+    [enc setBytes:&out_dim    length:4 atIndex:5];
+    [enc setBytes:&in_dim     length:4 atIndex:6];
+    [enc setBytes:&group_size length:4 atIndex:7];
+    [enc setBytes:&bn         length:4 atIndex:8];
+    uint32_t num_tgs = (out_dim + 7) / 8;
+    [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [enc endEncoding];
+}
+
+// Convenience: uses buf_pfb_input as input, buf_pfb_out[slot] as output
+static void gpu_encode_pfb_gemm(
+    MetalCtx *ctx,
+    id<MTLCommandBuffer> cmdbuf,
+    const uint32_t *W, const uint16_t *scales, const uint16_t *biases,
+    uint32_t out_dim, uint32_t in_dim, uint32_t group_size,
+    int batch_n, int out_slot
+) {
+    gpu_encode_pfb_gemm_ex(ctx, cmdbuf, W, scales, biases,
+                           out_dim, in_dim, group_size, batch_n,
+                           ctx->buf_pfb_input, 0,
+                           ctx->buf_pfb_out[out_slot], 0);
 }
 
 // Copy batch results from GPU buffers back to CPU pointers.
@@ -6398,6 +6711,27 @@ static void init_layer_scratch(void) {
     s_gated_out  = calloc(LINEAR_TOTAL_VALUE, sizeof(float));
 }
 
+// Pre-computed projection results for batched prefill (NULL = compute projections normally)
+typedef struct {
+    float *proj[4];  // Full attn: [0]=Q, [1]=K, [2]=V; Linear: [0]=QKV, [1]=Z, [2]=beta, [3]=alpha
+    int dims[4];     // Output dimension for each projection
+    int count;       // Number of projections (3 for full, 4 for linear)
+} PrecomputedProj;
+
+static void fused_layer_forward_ex(
+    WeightFile *wf,
+    int layer_idx,
+    float *hidden,
+    KVCache *kv,
+    LinearAttnState *la_state,
+    int pos,
+    const void *mmap_base,
+    int K,
+    int packed_fd,
+    PrecomputedProj *precomp  // NULL = compute projections, non-NULL = skip CMD1
+);
+
+// Original interface (all existing call sites use this)
 static void fused_layer_forward(
     WeightFile *wf,
     int layer_idx,
@@ -6409,14 +6743,39 @@ static void fused_layer_forward(
     int K,                   // number of active experts
     int packed_fd            // fd for packed expert file
 ) {
+    fused_layer_forward_ex(wf, layer_idx, hidden, kv, la_state, pos, mmap_base, K, packed_fd, NULL);
+}
+
+static void fused_layer_forward_ex(
+    WeightFile *wf,
+    int layer_idx,
+    float *hidden,
+    KVCache *kv,
+    LinearAttnState *la_state,
+    int pos,
+    const void *mmap_base,
+    int K,
+    int packed_fd,
+    PrecomputedProj *precomp
+) {
     // Per-layer quant: temporarily switch to the per-layer expert format
     int saved_use_2bit = g_use_2bit;
     int saved_use_q3_experts = g_use_q3_experts;
     int saved_use_q3_outlier = g_use_q3_outlier;
+    ExpertLayout saved_active_q3_layout = g_active_q3_layout;
+    int saved_active_q3_layout_valid = g_active_q3_layout_valid;
     if (saved_use_2bit) g_use_2bit = g_layer_is_2bit[layer_idx];
     if (saved_use_q3_experts) {
         g_use_q3_outlier = g_layer_is_q3_outlier[layer_idx];
         g_use_q3_experts = g_layer_is_q3_hybrid[layer_idx] || g_layer_is_q3_outlier[layer_idx];
+        if ((g_use_q3_experts || g_use_q3_outlier) &&
+            g_q3_layout_manifest_loaded &&
+            g_q3_layer_layout_valid[layer_idx]) {
+            g_active_q3_layout = g_q3_layer_layouts[layer_idx];
+            g_active_q3_layout_valid = 1;
+        } else {
+            g_active_q3_layout_valid = 0;
+        }
     }
 
     double t_layer_start = 0, t0 = 0, t1 = 0;
@@ -6478,11 +6837,54 @@ static void fused_layer_forward(
     id<MTLCommandBuffer> cmd1 = nil;
     int gpu_linear_attn = 0;  // set to 1 if GPU handles entire linear attention pipeline
 
-    // Pre-compute linear_layer_idx for GPU linear attention encoding in CMD1
+    // Pre-compute linear_layer_idx (needed in Phase 2 for delta-net)
     int linear_layer_idx = -1;
     if (!is_full) {
         linear_layer_idx = layer_idx - (layer_idx + 1) / FULL_ATTN_INTERVAL;
     }
+
+    // Variables declared here to allow goto to skip over CMD1
+    dispatch_group_t spec_group = NULL;
+    int spec_preload_count = 0;
+    int spec_routing_enabled = 0;  // DISABLED: cache pollution + overhead makes it slower
+
+    // ---- PRECOMPUTED PROJECTION SKIP ----
+    // If precomp is set, projections were already computed by batched GEMM.
+    // Copy results into scratch buffers, handle deferred completion, skip CMD1.
+    if (precomp) {
+        // Complete deferred experts from previous layer
+        if (g_timing_enabled) { t0 = now_ms(); }
+        wait_deferred_experts_gpu();
+        if (g_timing_enabled) { t1 = now_ms(); g_timing.deferred_wait += t1 - t0; }
+        if (g_timing_enabled) { t0 = now_ms(); }
+        finalize_deferred_experts();
+        if (g_timing_enabled) { t1 = now_ms(); g_timing.deferred_cpu += t1 - t0; }
+
+        // Residual = hidden before attention
+        cpu_vec_copy(residual, hidden, HIDDEN_DIM);
+
+        // Compute input norm and upload to buf_input (needed by CMD2 fused path)
+        cpu_rms_norm(hidden, lc->input_norm_w, normed, HIDDEN_DIM, RMS_NORM_EPS);
+        if (g_metal && g_metal->buf_input) {
+            memcpy([g_metal->buf_input contents], normed, HIDDEN_DIM * sizeof(float));
+        }
+
+        // Copy pre-computed projections into scratch buffers
+        if (is_full) {
+            memcpy(q_proj_out, precomp->proj[0], precomp->dims[0] * sizeof(float));
+            memcpy(k_out,      precomp->proj[1], precomp->dims[1] * sizeof(float));
+            memcpy(v_out,      precomp->proj[2], precomp->dims[2] * sizeof(float));
+        } else {
+            memcpy(qkv_out,    precomp->proj[0], precomp->dims[0] * sizeof(float));
+            memcpy(z_out,      precomp->proj[1], precomp->dims[1] * sizeof(float));
+            memcpy(beta_out,   precomp->proj[2], precomp->dims[2] * sizeof(float));
+            memcpy(alpha_out,  precomp->proj[3], precomp->dims[3] * sizeof(float));
+        }
+
+        // Skip CMD1 entirely — jump to PHASE 2 (attention compute)
+        goto phase2_attention;
+    }
+
     // Can we run the full linear attention pipeline on GPU in CMD1?
     int attn_specs_have_q8 = batch_specs_have_q8(attn_specs, num_attn_specs);
 
@@ -6778,10 +7180,6 @@ static void fused_layer_forward(
     // After CPU attention, we wait for the group to finish. When the real routing
     // happens later, predicted experts are already in the LRU cache as hits.
 
-    dispatch_group_t spec_group = NULL;
-    int spec_preload_count = 0;
-    int spec_routing_enabled = 0;  // DISABLED: cache pollution + overhead makes it slower
-
     if (g_timing_enabled) { t0 = now_ms(); }
     s_spec_count = 0;
 
@@ -6858,6 +7256,7 @@ static void fused_layer_forward(
     // =====================================================================
     // PHASE 2: CPU attention compute
     // =====================================================================
+phase2_attention:
 
     if (g_timing_enabled) { t0 = now_ms(); }
 
@@ -7975,6 +8374,8 @@ static void fused_layer_forward(
         g_use_2bit = saved_use_2bit;
         g_use_q3_outlier = saved_use_q3_outlier;
         g_use_q3_experts = saved_use_q3_experts;
+        g_active_q3_layout = saved_active_q3_layout;
+        g_active_q3_layout_valid = saved_active_q3_layout_valid;
         return;
 
     } else if (packed_fd >= 0) {
@@ -8048,6 +8449,8 @@ static void fused_layer_forward(
     g_use_2bit = saved_use_2bit;
     g_use_q3_outlier = saved_use_q3_outlier;
     g_use_q3_experts = saved_use_q3_experts;
+    g_active_q3_layout = saved_active_q3_layout;
+    g_active_q3_layout_valid = saved_active_q3_layout_valid;
 }
 
 // ============================================================================
@@ -9024,12 +9427,18 @@ static void print_usage(const char *prog) {
     printf("  --think-budget N     Max thinking tokens before force </think> (default: 2048, 0=unlimited)\n");
     printf("  --ppl PATH           Measure perplexity on ground truth token file\n");
     printf("  --stream             Clean streaming output (no progress, no stats)\n");
+    printf("  --pfb N              Enable batched prefill\n");
+    printf("  --prefill-skip-experts  Skip routed experts for intermediate prefill tokens (shared expert only)\n");
+    printf("  --no-batched-linear  Disable batched linear-attention prefill kernels (uses routed MoE tail + batched full-attn)\n");
     printf("  --gguf-embedding P   Use extracted GGUF Q8_0 embedding blob\n");
     printf("  --nax                Enable NAX tensor matmul for LM head (M5+, slower for single-token)\n");
     printf("  --no-nax             Disable NAX (default)\n");
     printf("  --serve PORT         Run HTTP server (OpenAI-compatible API)\n");
     printf("  --help               This message\n");
 }
+
+// Batched prefill implementation (separate file for maintainability)
+#include "batched_prefill.h"
 
 int main(int argc, char **argv) {
     @autoreleasepool {
@@ -9055,6 +9464,7 @@ int main(int argc, char **argv) {
         const char *ppl_tokens_path = NULL;
         int max_tokens = 20;
         int K = 4;
+        int K_explicit = 0;  // set to 1 if --k was passed
         int cache_entries = 0;  // default 0: trust OS page cache (38% faster than Metal LRU)
         int malloc_cache_entries = 0;  // 0 = disabled (override with --malloc-cache)
         int serve_port = 0;  // 0 = disabled, >0 = HTTP serve mode
@@ -9098,6 +9508,11 @@ int main(int argc, char **argv) {
             {"stream",        no_argument,       0, 'O'},
             {"nax",           no_argument,       0, 'X'},
             {"no-nax",        no_argument,       0, 'x'},
+            {"pfb",           required_argument, 0, 900},
+            {"prefill-skip-experts", no_argument, 0, 901},
+            {"prefill-k",     required_argument, 0, 903},
+            {"prefill-experts-full-only", no_argument, 0, 904},
+            {"no-batched-linear", no_argument, 0, 902},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
@@ -9122,7 +9537,7 @@ int main(int argc, char **argv) {
                 case 'p': prompt_tokens_path = optarg; break;
                 case 'P': prompt_text = optarg; break;
                 case 't': max_tokens = atoi(optarg); break;
-                case 'k': K = atoi(optarg); break;
+                case 'k': K = atoi(optarg); K_explicit = 1; break;
                 case 'C': cache_entries = atoi(optarg); break;
                 case 'M': malloc_cache_entries = atoi(optarg); break;
                 case 'L': gpu_linear_attn_enabled = 0; break;
@@ -9149,6 +9564,14 @@ int main(int argc, char **argv) {
                 case 'O': g_stream_mode = 1; break;
                 case 'X': g_nax_disabled = 0; break;  // --nax: enable
                 case 'x': g_nax_disabled = 1; break;  // --no-nax: disable
+                case 900: g_prefill_batch = atoi(optarg);
+                    if (g_prefill_batch < 1) g_prefill_batch = 1;
+                    if (g_prefill_batch > MAX_PFB) g_prefill_batch = MAX_PFB;
+                    break;
+                case 901: g_prefill_skip_experts = 1; break;
+                case 903: g_prefill_k = atoi(optarg); break;
+                case 904: g_prefill_experts_full_only = 1; break;
+                case 902: g_disable_batched_linear = 1; break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
@@ -9158,7 +9581,6 @@ int main(int argc, char **argv) {
             fprintf(stderr, "ERROR: --2bit and --q3-experts are mutually exclusive for now\n");
             return 1;
         }
-
         // Build default paths — check <model_path>/ first, then legacy locations
         char default_weights[1024], default_manifest[1024], default_vocab[1024];
 
@@ -9218,8 +9640,11 @@ int main(int argc, char **argv) {
             if (config_k > MAX_K) config_k = MAX_K;
             // Only override if user didn't explicitly set K via --k
             // (we detect this by checking if K is still the default 4)
-            if (K == 4 && config_k != 4) {
+            if (!K_explicit) {
                 K = config_k;
+                fprintf(stderr, "[config] K auto-set to %d from config (use --k N to override)\n", K);
+            } else {
+                fprintf(stderr, "[config] K override: %d (model default: %d)\n", K, g_cfg.num_experts_per_tok);
             }
         }
 
@@ -9432,6 +9857,7 @@ int main(int argc, char **argv) {
         void *layer_mmaps[MAX_LAYERS];
         size_t layer_mmap_sizes[MAX_LAYERS];
         int expert_layers_available = 0;
+        int q3_layout_loaded = 0;
 
         // Auto-detect expert size from first layer file
         {
@@ -9458,6 +9884,9 @@ int main(int argc, char **argv) {
         memset(g_layer_is_2bit, 0, sizeof(g_layer_is_2bit));
         memset(g_layer_is_q3_hybrid, 0, sizeof(g_layer_is_q3_hybrid));
         memset(g_layer_is_q3_outlier, 0, sizeof(g_layer_is_q3_outlier));
+        if (g_use_q3_experts) {
+            q3_layout_loaded = load_q3_layout_manifest(model_path);
+        }
 
         for (int i = 0; i < NUM_LAYERS; i++) {
             char path[1024];
@@ -9470,7 +9899,15 @@ int main(int argc, char **argv) {
                 snprintf(path, sizeof(path), "%s/packed_experts_Q3/layer_%02d.bin", model_path, i);
                 layer_fds[i] = open(path, O_RDONLY);
                 if (layer_fds[i] >= 0) {
-                    if (i == Q3_OUTLIER_LAYER) {
+                    if (q3_layout_loaded && g_q3_layer_layout_valid[i]) {
+                        if (expert_layout_is_q3_outlier(&g_q3_layer_layouts[i])) {
+                            g_layer_is_q3_outlier[i] = 1;
+                            layers_q3_outlier++;
+                        } else {
+                            g_layer_is_q3_hybrid[i] = 1;
+                            layers_q3++;
+                        }
+                    } else if (i == Q3_OUTLIER_LAYER) {
                         g_layer_is_q3_outlier[i] = 1;
                         layers_q3_outlier++;
                     } else {
@@ -9743,38 +10180,59 @@ int main(int argc, char **argv) {
         }
 
         // ---- Batch prefill loop ----
-        // Process all prompt tokens through the model. For intermediate tokens
-        // (not the last), we use discard_deferred_experts() which waits for the GPU
-        // but skips the CPU readback/combine of the last layer's expert outputs.
-        // This is safe because the hidden state from intermediate prefill tokens
-        // is immediately overwritten by the next token's embedding — the recurrent
-        // state (KV cache, delta-net state) is already updated inside fused_layer_forward.
-        if (pt->count > 1) {
+        double prefill_only_ms = 0;  // prefill time excluding last token + LM head
+        int prefill_token_count = pt->count > 1 ? pt->count - 1 : 0;
+        int prefill_was_batched = 0;
+        double t_prefill_start = now_ms();
+
+        if (pt->count > 1 && g_prefill_batch > 1 &&
+            (effective_prefill_skip_experts() || g_prefill_experts_full_only)) {
+            // Batched prefill (see batched_prefill.h)
+            // Linear layers: always K=0 (batched, shared expert only)
+            // Full attention layers: batched projections + attention, then:
+            //   - if experts_full_only: per-token expert I/O at full-attn layers
+            //   - if skip_experts: shared expert only (fastest)
+            int num_prefill = pt->count - 1;
+            pos += batched_prefill_k0(wf, hidden, embed_batch, num_prefill, pos,
+                                       kv_caches, layer_states, layer_mmaps, layer_fds, K);
+            prefill_only_ms = now_ms() - t_prefill_start;
+            prefill_was_batched = 1;
+
+        } else if (pt->count > 1) {
+            // ================================================================
+            // ORIGINAL PREFILL: one token at a time through all layers
+            // ================================================================
             double t_prefill_batch = now_ms();
             double first_tok_ms = 0;
+            int per_tok_K = (g_prefill_k >= 0) ? g_prefill_k :
+                            (effective_prefill_skip_experts() ? 0 : K);
+            printf("[prefill] starting %d tokens | per-token K=%d skip_experts=%d experts_full_only=%d\n",
+                   pt->count - 1, per_tok_K, effective_prefill_skip_experts(), g_prefill_experts_full_only);
 
             for (int token_idx = 0; token_idx < pt->count - 1; token_idx++) {
                 double t_tok = now_ms();
 
                 @autoreleasepool {
-                // Load pre-embedded token from batch buffer
                 cache_telemetry_note_token();
                 memcpy(hidden, embed_batch + (size_t)token_idx * HIDDEN_DIM,
                        HIDDEN_DIM * sizeof(float));
 
-                // Run through all 60 transformer layers
+                int prefill_K = (g_prefill_k >= 0) ? g_prefill_k :
+                                (effective_prefill_skip_experts() ? 0 : K);
                 for (int layer = 0; layer < NUM_LAYERS; layer++) {
                     int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+                    int layer_K = prefill_K;
+                    if (g_prefill_experts_full_only) {
+                        layer_K = is_full ? K : 0;  // full K at full-attn layers, K=0 at linear
+                    }
                     fused_layer_forward(wf, layer, hidden,
                                         is_full ? kv_caches[layer] : NULL,
                                         is_full ? NULL : layer_states[layer],
                                         pos,
                                         layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
-                                        K, layer_fds[layer]);
+                                        layer_K, layer_fds[layer]);
                 }
 
-                // Discard last layer's expert output — hidden will be overwritten
-                // by the next token's embedding. Only wait for GPU (buffer safety).
                 discard_deferred_experts();
                 pos++;
                 } // @autoreleasepool
@@ -9785,10 +10243,10 @@ int main(int argc, char **argv) {
             }
 
             double prefill_batch_ms = now_ms() - t_prefill_batch;
-            double avg_ms = (pt->count > 2) ?
-                (prefill_batch_ms - first_tok_ms) / (pt->count - 2) : first_tok_ms;
-            if (!g_stream_mode) printf("  [prefill] %d/%d tokens: %.0f ms (first: %.0f ms, rest avg: %.0f ms)\n",
-                   pt->count - 1, pt->count, prefill_batch_ms, first_tok_ms, avg_ms);
+            prefill_only_ms = prefill_batch_ms;
+            printf("[prefill done] %d tokens | %.0f ms | %.1f tok/s\n",
+                   pt->count - 1, prefill_batch_ms,
+                   prefill_batch_ms > 0 ? (pt->count - 1) * 1000.0 / prefill_batch_ms : 0);
         }
 
         // ---- Last prefill token (or single-token prompt) ----
@@ -9955,7 +10413,14 @@ int main(int argc, char **argv) {
             printf("\n\n--- Statistics ---\n");
             double total_time = now_ms() - t0;
             printf("Total time:     %.1f s\n", total_time / 1000.0);
-            printf("TTFT:           %.0f ms\n", ttft_ms);
+            if (prefill_token_count > 0 && prefill_only_ms > 0) {
+                printf("TTFT:           %.0f ms (prefill: %d tokens, %.1f tok/s%s)\n",
+                       ttft_ms, prefill_token_count,
+                       prefill_token_count * 1000.0 / prefill_only_ms,
+                       prefill_was_batched ? ", batched" : "");
+            } else {
+                printf("TTFT:           %.0f ms\n", ttft_ms);
+            }
             printf("Tokens:         %d generated\n", total_generated);
             if (total_generated > 1) {
                 double gen_time = total_time - ttft_ms;

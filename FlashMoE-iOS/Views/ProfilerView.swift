@@ -191,6 +191,14 @@ struct ProfilerView: View {
                         ? String(format: "%.0f ms", engine.timeToFirstToken)
                         : "--"
                 )
+                metricCell(
+                    icon: "arrow.right.circle",
+                    label: "Prefill",
+                    value: engine.prefillTokensPerSecond > 0
+                        ? String(format: "%.1f t/s%@", engine.prefillTokensPerSecond,
+                                 engine.prefillBatched ? " (bat)" : "")
+                        : "--"
+                )
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)

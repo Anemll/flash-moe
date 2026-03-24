@@ -750,6 +750,101 @@ kernel void dequant_matvec_4bit_v3(
 
 
 // ============================================================================
+// Kernel 1g: Batched 4-bit dequant GEMM for prefill (N tokens, read weights once)
+// ============================================================================
+// Processes N input vectors against the same weight matrix in one dispatch.
+// Weight data is read once per row and reused across all N tokens.
+// Each token's input is loaded into shared memory one at a time (16KB),
+// and its partial dot products are accumulated in per-token registers.
+//
+// Speedup: N× less weight bandwidth vs N separate GEMV dispatches.
+// Used during prefill to amortize projection weight reads.
+//
+// Layout: X[N, in_dim] token-major, Y[N, out_dim] token-major
+//
+#define MAX_PFB_GPU 32
+
+kernel void dequant_gemm_4bit_batch(
+    device const uint32_t* W_packed   [[buffer(0)]],  // [out_dim, in_dim/8]
+    device const uint16_t* scales     [[buffer(1)]],  // [out_dim, num_groups] bf16
+    device const uint16_t* biases     [[buffer(2)]],  // [out_dim, num_groups] bf16
+    device const float*    X          [[buffer(3)]],  // [N, in_dim] token-major
+    device float*          Y          [[buffer(4)]],  // [N, out_dim] token-major
+    constant uint&         out_dim    [[buffer(5)]],
+    constant uint&         in_dim     [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    constant uint&         batch_n    [[buffer(8)]],  // number of tokens (1..MAX_PFB_GPU)
+    uint tgid   [[threadgroup_position_in_grid]],
+    uint lid    [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    // Each SIMD group handles one output row (same as v3)
+    uint row = tgid * ROWS_PER_TG + simd_group;
+    if (row >= out_dim) return;
+
+    uint packed_cols = in_dim / 8;
+    uint num_groups  = in_dim / group_size;
+
+    // Per-token accumulators in registers
+    float acc[MAX_PFB_GPU];
+    for (uint n = 0; n < batch_n; n++) acc[n] = 0.0f;
+
+    // Pointers for this row's weights (read ONCE, reused across all N tokens)
+    device const uint32_t* w_row = W_packed + row * packed_cols;
+    device const uint16_t* s_row = scales + row * num_groups;
+    device const uint16_t* b_row = biases + row * num_groups;
+
+    // Outer loop: iterate over weight columns (each SIMD lane handles strided cols)
+    // Weight data read once; inner loop multiplies against all N input vectors.
+    // Input reads X[n * in_dim + x_base + nib] are coherent across SIMD lanes
+    // (all 32 lanes read same n,nib combo) so GPU cache line serves all lanes.
+    for (uint col = simd_lane; col < packed_cols; col += 32) {
+        uint g = col / (group_size / 8);
+        float scale = bf16_to_f32(s_row[g]);
+        float bias  = bf16_to_f32(b_row[g]);
+
+        // Read weight ONCE
+        uint32_t packed = w_row[col];
+        uint x_base = col * 8;
+
+        // Multiply dequantized weights against all N input vectors
+        // Uses same FMA pattern as v3: fma(nibble, scale*x, bias*x)
+        // to ensure bit-identical results.
+        for (uint n = 0; n < batch_n; n++) {
+            device const float* x_n = X + n * in_dim + x_base;
+
+            float sx0 = scale * x_n[0];  float bx0 = bias * x_n[0];
+            float sx1 = scale * x_n[1];  float bx1 = bias * x_n[1];
+            float sx2 = scale * x_n[2];  float bx2 = bias * x_n[2];
+            float sx3 = scale * x_n[3];  float bx3 = bias * x_n[3];
+            float sx4 = scale * x_n[4];  float bx4 = bias * x_n[4];
+            float sx5 = scale * x_n[5];  float bx5 = bias * x_n[5];
+            float sx6 = scale * x_n[6];  float bx6 = bias * x_n[6];
+            float sx7 = scale * x_n[7];  float bx7 = bias * x_n[7];
+
+            acc[n] += fma(float((packed >>  0) & 0xF), sx0, bx0);
+            acc[n] += fma(float((packed >>  4) & 0xF), sx1, bx1);
+            acc[n] += fma(float((packed >>  8) & 0xF), sx2, bx2);
+            acc[n] += fma(float((packed >> 12) & 0xF), sx3, bx3);
+            acc[n] += fma(float((packed >> 16) & 0xF), sx4, bx4);
+            acc[n] += fma(float((packed >> 20) & 0xF), sx5, bx5);
+            acc[n] += fma(float((packed >> 24) & 0xF), sx6, bx6);
+            acc[n] += fma(float((packed >> 28) & 0xF), sx7, bx7);
+        }
+    }
+
+    // SIMD reduce + write results for all tokens
+    for (uint n = 0; n < batch_n; n++) {
+        float sum = simd_sum(acc[n]);
+        if (simd_lane == 0) {
+            Y[n * out_dim + row] = sum;
+        }
+    }
+}
+
+
+// ============================================================================
 // Kernel 1f: 4-bit dequant matvec with LUT (eliminates uint→float conversions)
 // ============================================================================
 // Instead of converting each nibble to float (expensive conversion instruction),
@@ -1656,6 +1751,203 @@ kernel void gated_rms_norm(
 
 
 // ============================================================================
+// Batched linear-attention prefill kernels
+// ============================================================================
+
+kernel void conv1d_step_batched(
+    device float *conv_state,         // [(kernel_size-1) * conv_dim] persistent state
+    device const float *input,        // [batch_n * conv_dim]
+    device const uint16_t *weights,   // [conv_dim * 4] bf16
+    device float *output,             // [batch_n * conv_dim]
+    constant uint &conv_dim,          // = 12288
+    constant uint &batch_n,
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx >= conv_dim) return;
+
+    uint w_base = idx * 4;
+    float w0 = bf16_to_f32(weights[w_base + 0]);
+    float w1 = bf16_to_f32(weights[w_base + 1]);
+    float w2 = bf16_to_f32(weights[w_base + 2]);
+    float w3 = bf16_to_f32(weights[w_base + 3]);
+
+    float s0 = conv_state[0 * conv_dim + idx];
+    float s1 = conv_state[1 * conv_dim + idx];
+    float s2 = conv_state[2 * conv_dim + idx];
+
+    for (uint t = 0; t < batch_n; t++) {
+        uint off = t * conv_dim + idx;
+        float inp = input[off];
+        float acc = s0 * w0 + s1 * w1 + s2 * w2 + inp * w3;
+        output[off] = acc / (1.0f + exp(-acc));
+        s0 = s1;
+        s1 = s2;
+        s2 = inp;
+    }
+
+    conv_state[0 * conv_dim + idx] = s0;
+    conv_state[1 * conv_dim + idx] = s1;
+    conv_state[2 * conv_dim + idx] = s2;
+}
+
+kernel void rms_norm_qk_batched(
+    device float *q,              // [batch_n * token_stride] q at offset 0
+    device float *k,              // [batch_n * token_stride] k at bound offset
+    constant uint &key_dim,       // = 128
+    constant float &inv_scale,    // = 1/sqrt(key_dim)
+    constant uint &token_stride,  // = 12288
+    constant uint &batch_n,
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint3 tp [[thread_position_in_threadgroup]]
+) {
+    uint head = tg.x;
+    uint token = tg.y;
+    uint tid = tp.x;
+    if (token >= batch_n || tid >= key_dim) return;
+
+    uint q_base = token * token_stride + head * key_dim;
+    uint k_base = token * token_stride + head * key_dim;
+
+    threadgroup float partial[128];
+
+    float qval = q[q_base + tid];
+    partial[tid] = qval * qval;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float s = 0.0f;
+        for (uint i = 0; i < key_dim; i++) s += partial[i];
+        partial[0] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float q_inv_rms = rsqrt(partial[0] / float(key_dim) + 1e-6f);
+    q[q_base + tid] = qval * q_inv_rms * inv_scale * inv_scale;
+
+    float kval = k[k_base + tid];
+    partial[tid] = kval * kval;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float s = 0.0f;
+        for (uint i = 0; i < key_dim; i++) s += partial[i];
+        partial[0] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float k_inv_rms = rsqrt(partial[0] / float(key_dim) + 1e-6f);
+    k[k_base + tid] = kval * k_inv_rms * inv_scale;
+}
+
+kernel void compute_decay_beta_batched(
+    device const float *alpha_out,   // [batch_n * num_v_heads]
+    device const float *beta_out,    // [batch_n * num_v_heads]
+    device const float *A_log,       // [num_v_heads]
+    device const uint16_t *dt_bias,  // [num_v_heads] bf16
+    device float *g_decay,           // [batch_n * num_v_heads]
+    device float *beta_gate,         // [batch_n * num_v_heads]
+    constant uint &batch_n,
+    constant uint &num_v_heads,
+    uint idx [[thread_position_in_grid]]
+) {
+    uint total = batch_n * num_v_heads;
+    if (idx >= total) return;
+
+    uint vh = idx % num_v_heads;
+    float a_val = alpha_out[idx];
+    float dt_b = bf16_to_f32(dt_bias[vh]);
+    float A_val = exp(A_log[vh]);
+    float softplus_val = log(1.0f + exp(a_val + dt_b));
+    g_decay[idx] = exp(-A_val * softplus_val);
+    beta_gate[idx] = 1.0f / (1.0f + exp(-beta_out[idx]));
+}
+
+kernel void gated_delta_net_step_batched(
+    device float *state,             // [num_v_heads * key_dim * key_dim] persistent state
+    device const float *q,           // bound at q base, token stride = conv_dim
+    device const float *k,           // bound at k base, token stride = conv_dim
+    device const float *v,           // bound at v base, token stride = conv_dim
+    device const float *g_decay,     // [batch_n * num_v_heads]
+    device const float *beta_gate,   // [batch_n * num_v_heads]
+    device float *output,            // [batch_n * output_stride]
+    constant uint &k_heads_per_v,    // = num_k_heads / num_v_heads
+    constant uint &token_stride,     // = conv_dim (total QKV projection dim)
+    constant uint &output_stride,    // = num_v_heads * value_dim
+    constant uint &batch_n,
+    constant uint &num_v_heads,
+    constant uint &key_dim,
+    constant uint &value_dim,
+    uint head_id [[threadgroup_position_in_grid]],
+    uint vi [[thread_position_in_threadgroup]]
+) {
+    uint kh = head_id / k_heads_per_v;
+    uint state_base = head_id * key_dim * key_dim + vi * key_dim;
+    uint k_base = kh * key_dim;
+    uint v_base = head_id * value_dim;
+
+    for (uint t = 0; t < batch_n; t++) {
+        float g = g_decay[t * num_v_heads + head_id];
+        float beta = beta_gate[t * num_v_heads + head_id];
+
+        device const float *q_t = q + t * token_stride + k_base;
+        device const float *k_t = k + t * token_stride + k_base;
+        device const float *v_t = v + t * token_stride + v_base;
+
+        float kv_mem = 0.0f;
+        for (uint ki = 0; ki < key_dim; ki++) {
+            float s = state[state_base + ki] * g;
+            state[state_base + ki] = s;
+            kv_mem += s * k_t[ki];
+        }
+
+        float delta = (v_t[vi] - kv_mem) * beta;
+        for (uint ki = 0; ki < key_dim; ki++) {
+            state[state_base + ki] += k_t[ki] * delta;
+        }
+
+        float out_val = 0.0f;
+        for (uint ki = 0; ki < key_dim; ki++) {
+            out_val += state[state_base + ki] * q_t[ki];
+        }
+        output[t * output_stride + v_base + vi] = out_val;
+    }
+}
+
+kernel void gated_rms_norm_batched(
+    device const float *values,       // [batch_n * num_v_heads * value_dim]
+    device const float *z,            // [batch_n * num_v_heads * value_dim]
+    device const uint16_t *weight,    // [value_dim] bf16
+    device float *output,             // [batch_n * num_v_heads * value_dim]
+    constant uint &value_dim,         // = 128
+    constant uint &output_stride,     // = 8192
+    constant float &eps,              // = 1e-6
+    constant uint &batch_n,
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint3 tp [[thread_position_in_threadgroup]]
+) {
+    uint head = tg.x;
+    uint token = tg.y;
+    uint tid = tp.x;
+    if (token >= batch_n || tid >= value_dim) return;
+
+    uint base = token * output_stride + head * value_dim;
+    float val = values[base + tid];
+
+    threadgroup float partial[128];
+    partial[tid] = val * val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float s = 0.0f;
+        for (uint i = 0; i < value_dim; i++) s += partial[i];
+        partial[0] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float inv_rms = rsqrt(partial[0] / float(value_dim) + eps);
+    float zval = z[base + tid];
+    float gate = zval / (1.0f + exp(-zval));
+    float w = bf16_to_f32(weight[tid]);
+    output[base + tid] = val * inv_rms * gate * w;
+}
+
+
+// ============================================================================
 // Kernel 12: MoE combine + residual + shared expert gate (fused)
 // ============================================================================
 // Fused operation for CMD3 GPU-side combine:
@@ -1702,4 +1994,384 @@ kernel void moe_combine_residual(
     if (K > 7) moe += params[7] * expert_out7[tid];
 
     hidden_out[tid] = h_mid[tid] + moe + shared_gate * shared_out[tid];
+}
+
+// ============================================================================
+// Prefill: Full-attention Q deinterleave + RMS norm + RoPE
+// ============================================================================
+// Grid: [num_heads, batch_n, 1], 256 threads each.
+
+kernel void prefill_q_rope_norm_bf16(
+    device const float*    q_proj     [[buffer(0)]],  // [N, num_heads, 2 * head_dim]
+    device const uint16_t* q_norm_w   [[buffer(1)]],  // [head_dim] bf16
+    device float*          q_out      [[buffer(2)]],  // [N, num_heads, head_dim]
+    device float*          gate_out   [[buffer(3)]],  // [N, num_heads, head_dim]
+    constant uint&         head_dim   [[buffer(4)]],
+    constant uint&         num_heads  [[buffer(5)]],
+    constant uint&         rotary_dim [[buffer(6)]],
+    constant uint&         pos_base   [[buffer(7)]],
+    constant uint&         batch_n    [[buffer(8)]],
+    constant float&        eps        [[buffer(9)]],
+    constant float&        rope_theta [[buffer(10)]],
+    constant uint&         has_q_norm [[buffer(11)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint3 tp [[thread_position_in_threadgroup]]
+) {
+    uint lid = tp.x;
+    uint head = tg.x;
+    uint token = tg.y;
+    if (head >= num_heads || token >= batch_n || lid >= head_dim) return;
+
+    uint q_proj_stride = num_heads * head_dim * 2;
+    uint q_out_stride = num_heads * head_dim;
+    uint proj_base = token * q_proj_stride + head * 2 * head_dim;
+    uint out_base = token * q_out_stride + head * head_dim;
+
+    float q_val = q_proj[proj_base + lid];
+    float gate_val = q_proj[proj_base + head_dim + lid];
+
+    threadgroup float partial[256];
+    threadgroup float q_shared[256];
+
+    if (has_q_norm) {
+        partial[lid] = q_val * q_val;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lid == 0) {
+            float sum_sq = 0.0f;
+            for (uint i = 0; i < head_dim; i++) sum_sq += partial[i];
+            partial[0] = sum_sq;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        q_val = q_val * rsqrt(partial[0] / float(head_dim) + eps) * bf16_to_f32(q_norm_w[lid]);
+    }
+
+    q_shared[lid] = q_val;
+    gate_out[out_base + lid] = gate_val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint rotary_half = rotary_dim / 2;
+    if (lid < rotary_half) {
+        float freq = 1.0f / pow(rope_theta, (2.0f * float(lid)) / float(rotary_dim));
+        float angle = float(pos_base + token) * freq;
+        float cos_a = cos(angle);
+        float sin_a = sin(angle);
+        float q0 = q_shared[lid];
+        float q1 = q_shared[lid + rotary_half];
+        q_out[out_base + lid] = q0 * cos_a - q1 * sin_a;
+        q_out[out_base + lid + rotary_half] = q0 * sin_a + q1 * cos_a;
+    } else if (lid >= rotary_dim) {
+        q_out[out_base + lid] = q_shared[lid];
+    }
+}
+
+// ============================================================================
+// Prefill: Full-attention K RMS norm + RoPE + KV cache write
+// ============================================================================
+// Grid: [num_kv_heads, batch_n, 1], 256 threads each.
+
+kernel void prefill_kv_cache_bf16(
+    device const float*    k_proj     [[buffer(0)]],  // [N, num_kv_heads, head_dim]
+    device const float*    v_proj     [[buffer(1)]],  // [N, num_kv_heads, head_dim]
+    device const uint16_t* k_norm_w   [[buffer(2)]],  // [head_dim] bf16
+    device float*          k_cache    [[buffer(3)]],  // [max_seq, kv_dim]
+    device float*          v_cache    [[buffer(4)]],  // [max_seq, kv_dim]
+    constant uint&         head_dim   [[buffer(5)]],
+    constant uint&         kv_dim     [[buffer(6)]],
+    constant uint&         rotary_dim [[buffer(7)]],
+    constant uint&         pos_base   [[buffer(8)]],
+    constant uint&         cache_start [[buffer(9)]],
+    constant uint&         batch_n    [[buffer(10)]],
+    constant float&        eps        [[buffer(11)]],
+    constant float&        rope_theta [[buffer(12)]],
+    constant uint&         has_k_norm [[buffer(13)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint3 tp [[thread_position_in_threadgroup]]
+) {
+    uint lid = tp.x;
+    uint head = tg.x;
+    uint token = tg.y;
+    if (token >= batch_n || lid >= head_dim) return;
+
+    uint proj_base = token * kv_dim + head * head_dim;
+    uint cache_base = (cache_start + token) * kv_dim + head * head_dim;
+
+    float k_val = k_proj[proj_base + lid];
+    float v_val = v_proj[proj_base + lid];
+
+    threadgroup float partial[256];
+    threadgroup float k_shared[256];
+
+    if (has_k_norm) {
+        partial[lid] = k_val * k_val;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lid == 0) {
+            float sum_sq = 0.0f;
+            for (uint i = 0; i < head_dim; i++) sum_sq += partial[i];
+            partial[0] = sum_sq;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        k_val = k_val * rsqrt(partial[0] / float(head_dim) + eps) * bf16_to_f32(k_norm_w[lid]);
+    }
+
+    k_shared[lid] = k_val;
+    v_cache[cache_base + lid] = v_val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint rotary_half = rotary_dim / 2;
+    if (lid < rotary_half) {
+        float freq = 1.0f / pow(rope_theta, (2.0f * float(lid)) / float(rotary_dim));
+        float angle = float(pos_base + token) * freq;
+        float cos_a = cos(angle);
+        float sin_a = sin(angle);
+        float k0 = k_shared[lid];
+        float k1 = k_shared[lid + rotary_half];
+        k_cache[cache_base + lid] = k0 * cos_a - k1 * sin_a;
+        k_cache[cache_base + lid + rotary_half] = k0 * sin_a + k1 * cos_a;
+    } else if (lid >= rotary_dim) {
+        k_cache[cache_base + lid] = k_shared[lid];
+    }
+}
+
+// ============================================================================
+// Prefill: Batched causal attention with online softmax (Flash Attention style)
+// ============================================================================
+// Processes N query tokens against a KV cache with causal masking.
+// Query t attends to KV positions [0, cache_start + t].
+//
+// One threadgroup per (query, head) pair. Thread lid handles dimension d=lid.
+// Uses online softmax: streaming max/sum update avoids storing all scores.
+//
+// Grid: N * num_heads threadgroups, 256 threads each (= head_dim)
+// Requires: head_dim == tg_size (both 256)
+
+kernel void prefill_causal_attn(
+    device const float* Q          [[buffer(0)]],   // [N, num_heads, head_dim]
+    device const float* gate       [[buffer(1)]],   // [N, num_heads, head_dim]
+    device const float* K_cache    [[buffer(2)]],   // [max_seq, kv_dim]
+    device const float* V_cache    [[buffer(3)]],   // [max_seq, kv_dim]
+    device float*       out        [[buffer(4)]],   // [N, num_heads, head_dim]
+    constant uint&      head_dim   [[buffer(5)]],   // 256
+    constant uint&      kv_dim     [[buffer(6)]],   // num_kv_heads * head_dim
+    constant uint&      num_heads  [[buffer(7)]],   // 32
+    constant uint&      heads_per_kv [[buffer(8)]], // 16 (GQA ratio)
+    constant float&     scale      [[buffer(9)]],   // 1/sqrt(head_dim)
+    constant uint&      cache_start [[buffer(10)]],  // KV position of first query
+    constant uint&      batch_n    [[buffer(11)]],   // number of query tokens
+    uint tgid  [[threadgroup_position_in_grid]],
+    uint lid   [[thread_position_in_threadgroup]]
+) {
+    uint t = tgid / num_heads;
+    uint h = tgid % num_heads;
+    if (t >= batch_n) return;
+
+    uint seq_len = cache_start + t + 1;
+    uint kv_h = h / heads_per_kv;
+    uint d = lid;  // this thread handles dimension d
+
+    // Load Q[t, h] into shared memory for cooperative dot product
+    threadgroup float q_shared[256];
+    uint q_idx = t * num_heads * head_dim + h * head_dim + d;
+    q_shared[d] = Q[q_idx];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Shared memory for score reduction and softmax state broadcast
+    threadgroup float score_parts[8];   // partial sums from 8 SIMD groups
+    threadgroup float score_val;        // final score (broadcast)
+    threadgroup float corr_val;         // correction factor (broadcast)
+    threadgroup float w_val;            // weight for new V (broadcast)
+    threadgroup float attn_max;         // running max
+    threadgroup float attn_sum;         // running sum
+
+    if (d == 0) { attn_max = -1e30f; attn_sum = 0.0f; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint simd_lane = lid % 32;
+    uint simd_group = lid / 32;
+
+    float acc = 0.0f;  // per-thread V accumulator for dimension d
+
+    for (uint p = 0; p < seq_len; p++) {
+        // ---- Cooperative dot product: Q[t,h] . K[p] ----
+        float k_d = K_cache[p * kv_dim + kv_h * head_dim + d];
+        float partial = q_shared[d] * k_d;
+        float simd_val = simd_sum(partial);
+        if (simd_lane == 0) score_parts[simd_group] = simd_val;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Thread 0 reduces and updates online softmax
+        if (d == 0) {
+            float s = 0;
+            for (uint i = 0; i < 8; i++) s += score_parts[i];
+            s *= scale;
+            score_val = s;
+
+            float old_max = attn_max;
+            float new_max = max(old_max, s);
+            float corr = exp(old_max - new_max);
+            float w = exp(s - new_max);
+            attn_sum = attn_sum * corr + w;
+            attn_max = new_max;
+            corr_val = corr;
+            w_val = w;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ---- All threads: update accumulator ----
+        float v_d = V_cache[p * kv_dim + kv_h * head_dim + d];
+        acc = acc * corr_val + v_d * w_val;
+    }
+
+    // ---- Normalize and apply sigmoid gate ----
+    float inv_sum = 1.0f / attn_sum;
+    float gate_d = gate[q_idx];
+    float sigmoid_g = 1.0f / (1.0f + exp(-gate_d));
+
+    out[q_idx] = acc * inv_sum * sigmoid_g;
+}
+
+
+// ============================================================================
+// Prefill: Batched RMS norm for N tokens
+// ============================================================================
+// Input:  [N * dim] floats (N tokens × dim)
+// Weight: [dim] bf16 (shared across all tokens)
+// Output: [N * dim] floats
+// Grid: N threadgroups, 256 threads each
+
+kernel void prefill_rms_norm_bf16(
+    device const float*    x       [[buffer(0)]],  // [N * dim]
+    device const uint16_t* weight  [[buffer(1)]],  // [dim] bf16
+    device float*          out     [[buffer(2)]],  // [N * dim]
+    constant uint&         dim     [[buffer(3)]],  // 4096
+    constant float&        eps     [[buffer(4)]],
+    uint tgid [[threadgroup_position_in_grid]],     // token index
+    uint lid  [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    device const float* x_t = x + tgid * dim;
+    device float* out_t = out + tgid * dim;
+
+    // Sum of squares reduction
+    float acc = 0.0f;
+    for (uint i = lid; i < dim; i += tg_size) {
+        float v = x_t[i];
+        acc += v * v;
+    }
+
+    threadgroup float shared[8];
+    float simd_val = simd_sum(acc);
+    uint simd_lane = lid % 32;
+    uint simd_group = lid / 32;
+    if (simd_lane == 0) shared[simd_group] = simd_val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float sum_sq_broadcast;
+    if (simd_group == 0) {
+        float val = (simd_lane < (tg_size + 31) / 32) ? shared[simd_lane] : 0.0f;
+        val = simd_sum(val);
+        if (simd_lane == 0) sum_sq_broadcast = val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float rms = rsqrt(sum_sq_broadcast / float(dim) + eps);
+    for (uint i = lid; i < dim; i += tg_size) {
+        out_t[i] = x_t[i] * rms * bf16_to_f32(weight[i]);
+    }
+}
+
+
+// ============================================================================
+// Prefill: Batched residual add + RMS norm
+// ============================================================================
+// h_mid[t] = residual[t] + oproj[t], then norm h_mid → h_post
+// Grid: N threadgroups, 256 threads each
+
+kernel void prefill_residual_norm_bf16(
+    device const float*    residual [[buffer(0)]],  // [N * dim]
+    device const float*    oproj    [[buffer(1)]],  // [N * dim]
+    device float*          h_mid    [[buffer(2)]],  // [N * dim] output: residual + oproj
+    device float*          h_post   [[buffer(3)]],  // [N * dim] output: rms_norm(h_mid)
+    device const uint16_t* weight   [[buffer(4)]],  // [dim] bf16
+    constant uint&         dim      [[buffer(5)]],
+    constant float&        eps      [[buffer(6)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    uint off = tgid * dim;
+
+    // Residual add
+    for (uint i = lid; i < dim; i += tg_size) {
+        h_mid[off + i] = residual[off + i] + oproj[off + i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // RMS norm
+    float acc = 0.0f;
+    for (uint i = lid; i < dim; i += tg_size) {
+        float v = h_mid[off + i];
+        acc += v * v;
+    }
+
+    threadgroup float shared[8];
+    float simd_val = simd_sum(acc);
+    uint simd_lane = lid % 32;
+    uint simd_group = lid / 32;
+    if (simd_lane == 0) shared[simd_group] = simd_val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float sum_sq_broadcast;
+    if (simd_group == 0) {
+        float val = (simd_lane < (tg_size + 31) / 32) ? shared[simd_lane] : 0.0f;
+        val = simd_sum(val);
+        if (simd_lane == 0) sum_sq_broadcast = val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float rms = rsqrt(sum_sq_broadcast / float(dim) + eps);
+    for (uint i = lid; i < dim; i += tg_size) {
+        h_post[off + i] = h_mid[off + i] * rms * bf16_to_f32(weight[i]);
+    }
+}
+
+
+// ============================================================================
+// Prefill: Batched SwiGLU activation
+// ============================================================================
+// out[i] = silu(gate[i]) * up[i] for N * dim elements
+// Grid: total elements / 256
+
+kernel void prefill_swiglu(
+    device float*       gate_and_out [[buffer(0)]],  // [N * dim] — gate in, activation out
+    device const float* up           [[buffer(1)]],  // [N * dim]
+    constant uint&      total        [[buffer(2)]],  // N * dim
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= total) return;
+    float g = gate_and_out[tid];
+    float silu_g = g / (1.0f + exp(-g));
+    gate_and_out[tid] = silu_g * up[tid];
+}
+
+
+// ============================================================================
+// Prefill: Batched combine (hidden = h_mid + sigmoid(gate_score) * shared_out)
+// ============================================================================
+// Grid: N threadgroups, 256 threads each
+
+kernel void prefill_combine(
+    device const float* h_mid       [[buffer(0)]],  // [N * dim]
+    device const float* shared_out  [[buffer(1)]],  // [N * dim]
+    device const float* gate_scores [[buffer(2)]],  // [N] — one per token
+    device float*       hidden_out  [[buffer(3)]],  // [N * dim]
+    constant uint&      dim         [[buffer(4)]],
+    uint tgid [[threadgroup_position_in_grid]],      // token index
+    uint lid  [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    float gs = 1.0f / (1.0f + exp(-gate_scores[tgid]));
+    uint off = tgid * dim;
+    for (uint i = lid; i < dim; i += tg_size) {
+        hidden_out[off + i] = h_mid[off + i] + gs * shared_out[off + i];
+    }
 }
